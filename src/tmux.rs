@@ -46,27 +46,30 @@ impl TmuxManager {
             .unwrap_or(false)
     }
 
-    /// Launch a new detached tmux session that runs `claude`.
+    /// Launch a new detached tmux session that runs `command`.
     ///
-    /// If `resume_id` is provided, launches `claude --resume <id>` so Claude
-    /// Code picks up the previous conversation.
-    pub fn launch_claude_session(
+    /// `command` is split on whitespace into a program plus arguments (e.g.
+    /// `claude`, `bash`, `npm run cook`). If `resume_id` is provided, `--resume
+    /// <id>` is appended — used only for `claude` sessions so Claude Code picks
+    /// up the previous conversation.
+    pub fn launch_session(
         &self,
         name: &str,
         cwd: &str,
+        command: &str,
         resume_id: Option<&str>,
     ) -> Result<()> {
         Self::validate_target(name)?;
+
+        let argv = split_command(command);
+        if argv.is_empty() {
+            bail!("empty launch command for session '{}'", name);
+        }
+
         let mut cmd = Command::new("tmux");
-        cmd.args(["-L", &self.socket_name]).args([
-            "new-session",
-            "-d",
-            "-s",
-            name,
-            "-c",
-            cwd,
-            "claude",
-        ]);
+        cmd.args(["-L", &self.socket_name])
+            .args(["new-session", "-d", "-s", name, "-c", cwd])
+            .args(&argv);
 
         if let Some(id) = resume_id {
             cmd.args(["--resume", id]);
@@ -79,7 +82,8 @@ impl TmuxManager {
 
         if !status.success() {
             bail!(
-                "tmux new-session (claude) exited with status {} for session '{}'",
+                "tmux new-session ({}) exited with status {} for session '{}'",
+                argv[0],
                 status,
                 name
             );
@@ -555,6 +559,16 @@ pub fn alt_key_to_send_args(code: KeyCode, _modifiers: KeyModifiers) -> Option<S
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
+/// Split a launch command into a program plus arguments by ASCII whitespace.
+///
+/// This is a deliberately simple split: it handles `claude`, `bash`, and
+/// `npm run cook`, but not quoted arguments containing spaces or shell
+/// metacharacters (pipes, redirects). Empty/whitespace-only input yields an
+/// empty vec.
+fn split_command(command: &str) -> Vec<String> {
+    command.split_whitespace().map(str::to_string).collect()
+}
+
 /// Parse the raw output from `tmux list-sessions -F '...'` into structured
 /// window info.
 ///
@@ -723,6 +737,18 @@ session-c:win3:0:\n";
         assert_eq!(sanitize_tmux_name("a b c"), "a-b-c");
     }
 
+    #[test]
+    fn test_split_command() {
+        assert_eq!(split_command("claude"), vec!["claude"]);
+        assert_eq!(split_command("bash"), vec!["bash"]);
+        assert_eq!(split_command("npm run cook"), vec!["npm", "run", "cook"]);
+        // Extra/leading/trailing whitespace is collapsed.
+        assert_eq!(split_command("  npm   run  "), vec!["npm", "run"]);
+        // Empty / whitespace-only yields no argv.
+        assert!(split_command("").is_empty());
+        assert!(split_command("   ").is_empty());
+    }
+
     // -- Integration tests (require tmux installed) ----------------------
 
     #[test]
@@ -738,7 +764,7 @@ session-c:win3:0:\n";
         let mgr = TmuxManager::new("nexus-test-lk");
 
         // Launch claude session
-        mgr.launch_claude_session("test-sess", "/tmp", None)
+        mgr.launch_session("test-sess", "/tmp", "claude", None)
             .unwrap();
 
         // Verify it appears in list
@@ -765,7 +791,8 @@ session-c:win3:0:\n";
         let mgr = TmuxManager::new("nexus-test-kb");
 
         // Need at least one session for server to exist
-        mgr.launch_claude_session("kb-test", "/tmp", None).unwrap();
+        mgr.launch_session("kb-test", "/tmp", "claude", None)
+            .unwrap();
         mgr.configure_server().unwrap();
         mgr.kill_session("kb-test").unwrap();
     }
@@ -774,7 +801,8 @@ session-c:win3:0:\n";
     #[ignore]
     fn test_capture_pane_returns_content() {
         let mgr = TmuxManager::new("nexus-test-cap");
-        mgr.launch_claude_session("cap-test", "/tmp", None).unwrap();
+        mgr.launch_session("cap-test", "/tmp", "claude", None)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         let content = mgr.capture_pane("cap-test").unwrap();
@@ -787,7 +815,8 @@ session-c:win3:0:\n";
     #[ignore]
     fn test_send_keys_reaches_session() {
         let mgr = TmuxManager::new("nexus-test-sk");
-        mgr.launch_claude_session("sk-test", "/tmp", None).unwrap();
+        mgr.launch_session("sk-test", "/tmp", "claude", None)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         mgr.send_keys("sk-test", &SendKeysArgs::Literal("hello".to_string()))
@@ -802,7 +831,8 @@ session-c:win3:0:\n";
     #[ignore]
     fn test_resize_pane() {
         let mgr = TmuxManager::new("nexus-test-rp");
-        mgr.launch_claude_session("rp-test", "/tmp", None).unwrap();
+        mgr.launch_session("rp-test", "/tmp", "claude", None)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
 
         mgr.resize_pane("rp-test", 80, 24).unwrap();

@@ -31,6 +31,11 @@ pub struct GroupNode {
     pub children: Vec<TreeNode>,
 }
 
+// `SessionSummary` is a flat, frequently-constructed-and-matched value held
+// throughout the tree; boxing every session node to save a handful of bytes
+// over the size-difference threshold would add indirection at 18 call sites
+// for no real benefit.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub enum TreeNode {
     Group(GroupNode),
@@ -90,6 +95,7 @@ pub enum InputMode {
     TextInput,
     Confirm,
     GroupPicker,
+    TypePicker,
     Finder,
 }
 
@@ -126,6 +132,20 @@ pub enum InputContext {
         name: String,
         cwd: String,
         repo_root: Option<PathBuf>,
+    },
+    /// Final wizard step: pick which command the session launches.
+    NewSessionType {
+        name: String,
+        cwd: String,
+        repo_root: Option<PathBuf>,
+        group_id: Option<GroupId>,
+    },
+    /// Free-text command entry, reached from the "Custom" type choice.
+    NewSessionCommand {
+        name: String,
+        cwd: String,
+        repo_root: Option<PathBuf>,
+        group_id: Option<GroupId>,
     },
 }
 
@@ -175,6 +195,9 @@ pub struct SessionSummary {
     pub created_at: String,
     pub claude_session_id: Option<String>,
     pub worktree: Option<WorktreeInfo>,
+    /// The command this session launches in tmux (e.g. `claude`, `bash`).
+    /// Only `claude` sessions get conversation resume.
+    pub launch_command: String,
     #[serde(skip)]
     pub jsonl_path: Option<PathBuf>,
 }

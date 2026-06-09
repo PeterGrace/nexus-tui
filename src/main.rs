@@ -72,6 +72,7 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
             cwd,
             group,
             worktree,
+            command,
         } => {
             let _lock = acquire_lock()?;
             let tmux = tmux::TmuxManager::new(&config.tmux.socket_name);
@@ -119,7 +120,7 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
                 None => (cwd.as_str(), None),
             };
 
-            let id = db.create_nexus_session(&name, session_cwd, &tmux_name, wt_ref)?;
+            let id = db.create_nexus_session(&name, session_cwd, &tmux_name, &command, wt_ref)?;
 
             if let Some(group_name) = group {
                 let gid = match db.get_group_id_by_name(&group_name)? {
@@ -130,7 +131,7 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
             }
 
             if tmux.is_available() {
-                tmux.launch_claude_session(&tmux_name, session_cwd, None)?;
+                tmux.launch_session(&tmux_name, session_cwd, &command, None)?;
             }
             println!("Created session '{}' ({})", name, id);
         }
@@ -145,9 +146,17 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
                 .ok_or_else(|| color_eyre::eyre::eyre!("Session '{}' has no cwd", session_id))?;
             let name = sanitize_tmux_name(&session_id);
             let tree = db.get_visible_tree(true)?;
-            let resume_id =
-                find_session_in_tree(&tree, &session_id).and_then(|s| s.claude_session_id.clone());
-            tmux.launch_claude_session(&name, &cwd, resume_id.as_deref())?;
+            let session = find_session_in_tree(&tree, &session_id);
+            let command = session
+                .map(|s| s.launch_command.clone())
+                .unwrap_or_else(|| "claude".to_string());
+            // Only Claude sessions resume a prior conversation.
+            let resume_id = if command == "claude" {
+                session.and_then(|s| s.claude_session_id.clone())
+            } else {
+                None
+            };
+            tmux.launch_session(&name, &cwd, &command, resume_id.as_deref())?;
             db.update_session_status(&session_id, types::SessionStatus::Active)?;
             println!("Launched session '{}'", session_id);
         }

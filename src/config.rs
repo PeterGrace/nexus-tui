@@ -18,6 +18,10 @@ pub struct NexusConfig {
     pub tmux: TmuxConfig,
     #[serde(default)]
     pub worktree: WorktreeConfig,
+    /// User-defined session launch types, offered in the new-session picker
+    /// alongside the built-in Claude and Custom entries.
+    #[serde(default)]
+    pub session_types: Vec<SessionTypeDef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +43,13 @@ pub struct GroupDef {
     pub name: String,
     #[serde(default)]
     pub icon: String,
+}
+
+/// A named launch profile: a label shown in the picker and the command tmux runs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionTypeDef {
+    pub name: String,
+    pub cmd: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -255,6 +266,30 @@ on_teardown = "scripts/wt-teardown.sh"
         let cfg = parse_and_validate("").unwrap();
         assert!(cfg.worktree.on_create.is_none());
         assert!(cfg.worktree.on_teardown.is_none());
+    }
+
+    #[test]
+    fn test_session_types_parsed() {
+        let toml_str = r#"
+[[session_types]]
+name = "Cook"
+cmd = "bash"
+
+[[session_types]]
+name = "Notes"
+cmd = "nvim ~/notes.md"
+"#;
+        let cfg = parse_and_validate(toml_str).unwrap();
+        assert_eq!(cfg.session_types.len(), 2);
+        assert_eq!(cfg.session_types[0].name, "Cook");
+        assert_eq!(cfg.session_types[0].cmd, "bash");
+        assert_eq!(cfg.session_types[1].cmd, "nvim ~/notes.md");
+    }
+
+    #[test]
+    fn test_session_types_absent() {
+        let cfg = parse_and_validate("").unwrap();
+        assert!(cfg.session_types.is_empty());
     }
 
     #[test]

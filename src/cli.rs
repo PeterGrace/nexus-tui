@@ -37,6 +37,10 @@ pub enum Commands {
         /// Create an isolated git worktree for this session
         #[arg(short = 'w', long)]
         worktree: bool,
+        /// Command to launch in the session (default: claude). Only `claude`
+        /// sessions resume a prior conversation.
+        #[arg(long, default_value = "claude")]
+        command: String,
     },
     /// Launch/resume a session in tmux
     Launch {

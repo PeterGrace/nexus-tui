@@ -15,7 +15,8 @@ Nexus gives you a persistent, organized workspace for managing multiple Claude C
 - **8 color themes** — cycle with `Alt+t`, persisted across restarts
 - **Session lifecycle** — create, rename, move, delete, and kill sessions from the TUI or CLI
 - **Worktree isolation** — optionally create a dedicated git worktree per session for branch-level isolation
-- **Claude session resume** — automatically detects Claude Code session IDs so relaunched sessions resume where they left off
+- **Custom launch commands** — launch `claude`, a plain `bash` shell, or any command you define as a session type (e.g. for async "cooking" sessions)
+- **Claude session resume** — automatically detects Claude Code session IDs so relaunched Claude sessions resume where they left off
 - **CLI + JSON output** — scriptable interface for all operations (`nexus list --json`)
 - **Lazygit integration** — open lazygit in any session's working directory with `Alt+l`
 - **Editor integration** — open your editor in any session's working directory with `Alt+v`
@@ -93,6 +94,7 @@ nexus show <id>                      # Show session details (ID prefix supported
 nexus new <name>                     # Create and launch a new session
 nexus new <name> -c /path -g mygroup # With cwd and group
 nexus new <name> -w                  # Create with an isolated git worktree
+nexus new <name> --command bash      # Launch a command other than claude
 nexus launch <id>                    # Launch/resume a session in tmux
 nexus kill <name>                    # Kill a running tmux session
 nexus groups                         # List configured groups
@@ -124,11 +126,30 @@ name = "work"
 
 [[groups]]
 name = "personal"
+
+# Define custom session launch types (offered in the new-session picker)
+[[session_types]]
+name = "Cook"
+cmd = "bash"
+
+[[session_types]]
+name = "Notes"
+cmd = "nvim ~/notes.md"
 ```
 
 ### Groups
 
 Groups organize your sessions in the tree view. Create them in the config file or on-the-fly with `Alt+g` in the TUI or `nexus group-create` from the CLI.
+
+### Session Types
+
+By default a new session launches `claude`. The final step of the new-session flow (`Alt+n`) is a **session type** picker offering:
+
+- **Claude** — runs `claude`; this is the only type that resumes a prior conversation on relaunch.
+- Any `[[session_types]]` you define in the config (each with a `name` shown in the picker and a `cmd` that tmux runs).
+- **Custom…** — prompts for a free-text command to run once.
+
+Non-Claude sessions relaunch their command verbatim and show only the live terminal (no conversation log). From the CLI, use `nexus new <name> --command <cmd>`. Commands are split on whitespace, so `bash` and `npm run cook` work, but quoting and shell pipes are not supported.
 
 ### Themes
 

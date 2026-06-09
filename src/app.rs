@@ -91,6 +91,9 @@ pub struct App {
     // Group picker state
     pub(crate) picker_groups: Vec<(GroupId, String)>,
     pub(crate) picker_cursor: usize,
+    // Session-type picker state: (label, command). `None` command = "Custom"
+    // (prompts for a free-text command).
+    pub(crate) picker_types: Vec<(String, Option<String>)>,
     // Path completion state (active during NewSessionCwd input)
     pub(crate) path_suggestions: Vec<String>,
     pub(crate) path_suggestion_cursor: usize,
@@ -148,6 +151,7 @@ struct PendingWorktreeCtx {
     repo_root: PathBuf,
     branch: String,
     group_id: Option<GroupId>,
+    command: String,
 }
 
 /// Bundled state for a background worktree teardown.
@@ -246,6 +250,7 @@ impl App {
             show_dead_sessions: false,
             picker_groups: Vec::new(),
             picker_cursor: 0,
+            picker_types: Vec::new(),
             path_suggestions: Vec::new(),
             path_suggestion_cursor: 0,
             needs_full_redraw: false,
@@ -545,6 +550,7 @@ impl App {
                         InputMode::TextInput => self.handle_text_input_key(key),
                         InputMode::Confirm => self.handle_confirm_key(key),
                         InputMode::GroupPicker => self.handle_group_picker_key(key),
+                        InputMode::TypePicker => self.handle_type_picker_key(key),
                         InputMode::Finder => self.handle_finder_key(key),
                         InputMode::Normal => unreachable!(),
                     }
@@ -1014,6 +1020,17 @@ impl App {
                     self.transition_to_group_or_create(name, buffer, None);
                 }
             }
+            InputContext::NewSessionCommand {
+                name,
+                cwd,
+                repo_root,
+                group_id,
+            } => {
+                let command = buffer.trim().to_string();
+                self.input_mode = InputMode::Normal;
+                self.input_buffer.clear();
+                self.create_session_maybe_worktree(&name, &cwd, group_id, repo_root, &command);
+            }
             InputContext::RenameSession { session_id } => {
                 let new_tmux_name = sanitize_tmux_name(&buffer);
                 let new_tmux_name = self
@@ -1086,10 +1103,100 @@ impl App {
                 });
             }
             _ => {
-                self.create_session_maybe_worktree(&name, &cwd, None, repo_root);
-                self.input_mode = InputMode::Normal;
                 self.input_buffer.clear();
+                self.transition_to_type_picker(name, cwd, repo_root, None);
             }
+        }
+    }
+
+    /// Final wizard step: build the session-type picker (Claude + config types +
+    /// Custom) and enter `TypePicker` mode. If only Claude is available, skip the
+    /// picker and create directly.
+    fn transition_to_type_picker(
+        &mut self,
+        name: String,
+        cwd: String,
+        repo_root: Option<PathBuf>,
+        group_id: Option<GroupId>,
+    ) {
+        let mut types: Vec<(String, Option<String>)> =
+            vec![("Claude".to_string(), Some("claude".to_string()))];
+        for st in &self.config.session_types {
+            types.push((st.name.clone(), Some(st.cmd.clone())));
+        }
+        types.push(("Custom…".to_string(), None));
+
+        // No user-defined types: only Claude + Custom. Still show the picker so
+        // Custom remains reachable.
+        self.picker_types = types;
+        self.picker_cursor = 0;
+        self.input_mode = InputMode::TypePicker;
+        self.input_context = Some(InputContext::NewSessionType {
+            name,
+            cwd,
+            repo_root,
+            group_id,
+        });
+    }
+
+    fn handle_type_picker_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.input_mode = InputMode::Normal;
+                self.input_context = None;
+                self.picker_types.clear();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.picker_types.is_empty() {
+                    self.picker_cursor = (self.picker_cursor + 1) % self.picker_types.len();
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if !self.picker_types.is_empty() {
+                    if self.picker_cursor == 0 {
+                        self.picker_cursor = self.picker_types.len() - 1;
+                    } else {
+                        self.picker_cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                let choice = self.picker_types.get(self.picker_cursor).cloned();
+                let ctx = self.input_context.take();
+                self.picker_types.clear();
+                let (name, cwd, repo_root, group_id) = match ctx {
+                    Some(InputContext::NewSessionType {
+                        name,
+                        cwd,
+                        repo_root,
+                        group_id,
+                    }) => (name, cwd, repo_root, group_id),
+                    other => {
+                        self.input_context = other;
+                        self.input_mode = InputMode::Normal;
+                        return;
+                    }
+                };
+                match choice {
+                    // Concrete command — create the session now.
+                    Some((_, Some(cmd))) => {
+                        self.input_mode = InputMode::Normal;
+                        self.create_session_maybe_worktree(&name, &cwd, group_id, repo_root, &cmd);
+                    }
+                    // "Custom…" — prompt for a free-text command.
+                    _ => {
+                        self.input_buffer.clear();
+                        self.input_mode = InputMode::TextInput;
+                        self.input_context = Some(InputContext::NewSessionCommand {
+                            name,
+                            cwd,
+                            repo_root,
+                            group_id,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1283,7 +1390,9 @@ impl App {
                     }) => {
                         // gid 0 is the "Ungrouped" sentinel
                         let group = gid.filter(|&id| id != 0);
-                        self.create_session_maybe_worktree(&name, &cwd, group, repo_root);
+                        self.picker_groups.clear();
+                        self.transition_to_type_picker(name, cwd, repo_root, group);
+                        return;
                     }
                     other => {
                         self.input_context = other;
@@ -1489,8 +1598,8 @@ impl App {
     // Session creation + launch
     // -----------------------------------------------------------------------
 
-    fn create_session(&mut self, name: &str, cwd: &str, group_id: Option<GroupId>) {
-        self.finalize_session_creation(name, cwd, group_id, None);
+    fn create_session(&mut self, name: &str, cwd: &str, group_id: Option<GroupId>, command: &str) {
+        self.finalize_session_creation(name, cwd, group_id, None, command);
     }
 
     /// Shared session creation logic for both plain and worktree sessions.
@@ -1500,19 +1609,23 @@ impl App {
         cwd: &str,
         group_id: Option<GroupId>,
         worktree: Option<&WorktreeInfo>,
+        command: &str,
     ) {
         let tmux_name = sanitize_tmux_name(name);
         let tmux_name = self
             .db
             .next_unique_tmux_name(&tmux_name, None)
             .unwrap_or(tmux_name);
+        // JSONL snapshots only matter for Claude sessions (conversation resume).
         let snapshot = snapshot_jsonl_stems(cwd);
         match self
             .db
-            .create_nexus_session(name, cwd, &tmux_name, worktree)
+            .create_nexus_session(name, cwd, &tmux_name, command, worktree)
         {
             Ok(id) => {
-                self.jsonl_snapshots.insert(id.clone(), snapshot);
+                if command == "claude" {
+                    self.jsonl_snapshots.insert(id.clone(), snapshot);
+                }
                 if let Some(gid) = group_id {
                     if let Err(e) = self.db.assign_session_to_group(&id, gid) {
                         self.status_message =
@@ -1520,7 +1633,7 @@ impl App {
                     }
                 }
                 if self.tmux_available {
-                    if let Err(e) = self.tmux.launch_claude_session(&tmux_name, cwd, None) {
+                    if let Err(e) = self.tmux.launch_session(&tmux_name, cwd, command, None) {
                         self.status_message =
                             Some((format!("tmux launch failed: {e}"), Instant::now()));
                         self.refresh_tree();
@@ -1548,11 +1661,12 @@ impl App {
         cwd: &str,
         group_id: Option<GroupId>,
         repo_root: Option<PathBuf>,
+        command: &str,
     ) {
         let repo_root = match repo_root {
             Some(r) => r,
             None => {
-                self.create_session(name, cwd, group_id);
+                self.create_session(name, cwd, group_id, command);
                 return;
             }
         };
@@ -1618,6 +1732,7 @@ impl App {
                 repo_root,
                 branch,
                 group_id,
+                command: command.to_string(),
             },
         });
     }
@@ -1642,7 +1757,13 @@ impl App {
                     repo_root: ctx.repo_root,
                 };
                 self.status_message = Some(("Worktree created".to_string(), Instant::now()));
-                self.finalize_session_creation(&ctx.name, &ctx.cwd, ctx.group_id, Some(&wt_info));
+                self.finalize_session_creation(
+                    &ctx.name,
+                    &ctx.cwd,
+                    ctx.group_id,
+                    Some(&wt_info),
+                    &ctx.command,
+                );
             }
             Err(e) => {
                 self.status_message = Some((format!("worktree failed: {e}"), Instant::now()));
@@ -1713,17 +1834,25 @@ impl App {
                     None => sanitize_tmux_name(&session.session_id),
                 };
 
+                // Only Claude sessions resume a prior conversation; other
+                // commands relaunch verbatim.
+                let is_claude = session.launch_command == "claude";
+                let resume_id = if is_claude {
+                    session.claude_session_id.as_deref()
+                } else {
+                    None
+                };
+
                 // Snapshot before fresh launch so we can detect the new JSONL
-                if session.claude_session_id.is_none() {
+                if is_claude && session.claude_session_id.is_none() {
                     self.jsonl_snapshots
                         .insert(session.session_id.clone(), snapshot_jsonl_stems(&cwd));
                 }
 
-                if let Err(e) = self.tmux.launch_claude_session(
-                    &tmux_name,
-                    &cwd,
-                    session.claude_session_id.as_deref(),
-                ) {
+                if let Err(e) =
+                    self.tmux
+                        .launch_session(&tmux_name, &cwd, &session.launch_command, resume_id)
+                {
                     self.status_message =
                         Some((format!("tmux launch failed: {e}"), Instant::now()));
                     return;

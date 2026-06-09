@@ -22,6 +22,7 @@ pub fn mock_tree() -> Vec<TreeNode> {
                     created_at: "2026-02-28T10:00:00Z".to_string(),
                     claude_session_id: None,
                     worktree: None,
+                    launch_command: "claude".to_string(),
                     jsonl_path: None,
                 }),
                 TreeNode::Session(SessionSummary {
@@ -36,6 +37,7 @@ pub fn mock_tree() -> Vec<TreeNode> {
                     created_at: "2026-02-27T08:00:00Z".to_string(),
                     claude_session_id: None,
                     worktree: None,
+                    launch_command: "claude".to_string(),
                     jsonl_path: None,
                 }),
             ],
@@ -58,6 +60,7 @@ pub fn mock_tree() -> Vec<TreeNode> {
                     created_at: "2026-02-28T12:00:00Z".to_string(),
                     claude_session_id: None,
                     worktree: None,
+                    launch_command: "claude".to_string(),
                     jsonl_path: None,
                 }),
                 TreeNode::Group(GroupNode {
@@ -77,6 +80,7 @@ pub fn mock_tree() -> Vec<TreeNode> {
                         created_at: "2026-02-25T10:00:00Z".to_string(),
                         claude_session_id: None,
                         worktree: None,
+                        launch_command: "claude".to_string(),
                         jsonl_path: None,
                     })],
                 }),
@@ -99,6 +103,7 @@ pub fn mock_tree() -> Vec<TreeNode> {
                 created_at: "2026-02-20T08:00:00Z".to_string(),
                 claude_session_id: None,
                 worktree: None,
+                launch_command: "claude".to_string(),
                 jsonl_path: None,
             }]
             .into_iter()

@@ -107,6 +107,7 @@ impl Database {
             "ALTER TABLE sessions ADD COLUMN claude_session_id TEXT",
             "ALTER TABLE sessions ADD COLUMN worktree_branch TEXT",
             "ALTER TABLE sessions ADD COLUMN worktree_repo_root TEXT",
+            "ALTER TABLE sessions ADD COLUMN launch_command TEXT NOT NULL DEFAULT 'claude'",
         ];
         for sql in &additions {
             match self.conn.execute_batch(sql) {
@@ -150,6 +151,7 @@ impl Database {
         name: &str,
         cwd: &str,
         tmux_name: &str,
+        command: &str,
         worktree: Option<&WorktreeInfo>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
@@ -162,9 +164,9 @@ impl Database {
             "INSERT INTO sessions
                 (session_id, display_name, cwd, last_active, is_active,
                  tmux_name, status, created_by, created_at,
-                 worktree_branch, worktree_repo_root)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'active', 'nexus', ?6, ?7, ?8)",
-            params![id, name, cwd, now, tmux_name, now, wt_branch, wt_repo],
+                 worktree_branch, worktree_repo_root, launch_command)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'active', 'nexus', ?6, ?7, ?8, ?9)",
+            params![id, name, cwd, now, tmux_name, now, wt_branch, wt_repo, command],
         )?;
 
         Ok(id)
@@ -334,7 +336,8 @@ impl Database {
                     s.last_active, s.is_active,
                     s.tmux_name, s.status, s.created_by, s.created_at,
                     s.claude_session_id,
-                    s.worktree_branch, s.worktree_repo_root
+                    s.worktree_branch, s.worktree_repo_root,
+                    s.launch_command
              FROM sessions s
              JOIN session_groups sg ON s.session_id = sg.session_id
              WHERE 1=1 {status_filter}
@@ -513,7 +516,8 @@ impl Database {
                     s.last_active, s.is_active,
                     s.tmux_name, s.status, s.created_by, s.created_at,
                     s.claude_session_id,
-                    s.worktree_branch, s.worktree_repo_root
+                    s.worktree_branch, s.worktree_repo_root,
+                    s.launch_command
              FROM sessions s
              WHERE s.session_id NOT IN (SELECT session_id FROM session_groups)
              {status_filter}
@@ -570,7 +574,7 @@ fn row_to_summary(row: &rusqlite::Row<'_>) -> SessionSummary {
 /// Column layout (relative to `start`):
 ///   0: session_id, 1: display_name, 2: cwd, 3: last_active, 4: is_active,
 ///   5: tmux_name, 6: status, 7: created_by, 8: created_at, 9: claude_session_id,
-///   10: worktree_branch, 11: worktree_repo_root
+///   10: worktree_branch, 11: worktree_repo_root, 12: launch_command
 fn row_to_summary_at(row: &rusqlite::Row<'_>, start: usize) -> SessionSummary {
     let cwd_str: Option<String> = row.get(start + 2).unwrap_or(None);
     let status_str: String = row.get(start + 6).unwrap_or_default();
@@ -599,6 +603,11 @@ fn row_to_summary_at(row: &rusqlite::Row<'_>, start: usize) -> SessionSummary {
         created_at: row.get(start + 8).unwrap_or_default(),
         claude_session_id: row.get(start + 9).unwrap_or(None),
         worktree,
+        launch_command: row
+            .get::<_, Option<String>>(start + 12)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "claude".to_string()),
         jsonl_path: None,
     }
 }
@@ -613,7 +622,8 @@ mod tests {
 
     // Helper: shorthand for creating sessions without worktree
     fn create_session(db: &Database, name: &str, cwd: &str, tmux: &str) -> String {
-        db.create_nexus_session(name, cwd, tmux, None).unwrap()
+        db.create_nexus_session(name, cwd, tmux, "claude", None)
+            .unwrap()
     }
 
     #[test]
@@ -632,6 +642,27 @@ mod tests {
         let ungrouped = db.get_ungrouped_sessions().unwrap();
         assert_eq!(ungrouped.len(), 1);
         assert_eq!(ungrouped[0], id);
+    }
+
+    #[test]
+    fn test_launch_command_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        // Default helper uses "claude"
+        let claude_id = create_session(&db, "claude-sess", "/tmp", "claude-sess");
+        // Explicit non-claude command
+        let bash_id = db
+            .create_nexus_session("cook", "/tmp", "cook", "bash", None)
+            .unwrap();
+
+        let tree = db.get_tree().unwrap();
+        assert_eq!(
+            find_session(&tree, &claude_id).unwrap().launch_command,
+            "claude"
+        );
+        assert_eq!(
+            find_session(&tree, &bash_id).unwrap().launch_command,
+            "bash"
+        );
     }
 
     #[test]
@@ -994,6 +1025,7 @@ mod tests {
                 "wt-test",
                 "/home/user/repo/.worktrees/my-feature",
                 "wt-test",
+                "claude",
                 Some(&wt),
             )
             .unwrap();
@@ -1032,6 +1064,7 @@ mod tests {
                 "stale",
                 "/nonexistent/path/.worktrees/stale",
                 "stale",
+                "claude",
                 Some(&wt),
             )
             .unwrap();
@@ -1053,7 +1086,7 @@ mod tests {
             repo_root: std::path::PathBuf::from("/tmp"),
         };
         let id = db
-            .create_nexus_session("feat", "/tmp/.worktrees/feat", "feat", Some(&wt))
+            .create_nexus_session("feat", "/tmp/.worktrees/feat", "feat", "claude", Some(&wt))
             .unwrap();
 
         db.clear_worktree_columns(&id).unwrap();

@@ -123,6 +123,15 @@ impl InteractorState {
     /// Pre-renders the turns into `Text<'static>` so the render loop
     /// doesn't rebuild styled lines every frame.
     fn load_conversation_log(&mut self, session: &SessionSummary) {
+        // Conversation logs are Claude-specific. Non-Claude sessions (e.g. bash)
+        // have no JSONL to parse — show a placeholder instead of an empty pane.
+        if session.launch_command != "claude" {
+            let text = ratatui::text::Text::from(
+                "Session detached — select it to relaunch the live terminal.",
+            );
+            self.current_content = Some(SessionContent::ConversationLog(text));
+            return;
+        }
         let turns = session
             .jsonl_path
             .as_ref()

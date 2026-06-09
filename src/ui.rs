@@ -221,6 +221,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, elapsed: Duration) {
         InputMode::GroupPicker => {
             render_group_picker(frame, main_area, app);
         }
+        InputMode::TypePicker => {
+            render_type_picker(frame, main_area, app);
+        }
         InputMode::Finder => {
             render_finder(frame, area, app);
         }
@@ -277,6 +280,7 @@ fn render_text_input(frame: &mut Frame, panel_area: Rect, app: &App) {
         Some(InputContext::RenameSession { .. }) => "New name",
         Some(InputContext::RenameGroup { .. }) => "New name",
         Some(InputContext::NewGroupName) => "Group name",
+        Some(InputContext::NewSessionCommand { .. }) => "Launch command",
         _ => "Input",
     };
 
@@ -496,6 +500,59 @@ fn render_group_picker(frame: &mut Frame, panel_area: Rect, app: &App) {
                 Style::new().fg(theme::text())
             };
             Line::from(Span::styled(format!("{prefix}{name}"), style))
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Final wizard step: pick the launch command (Claude / config types / Custom).
+fn render_type_picker(frame: &mut Frame, panel_area: Rect, app: &App) {
+    let type_count = app.picker_types.len();
+    let picker_height = (type_count as u16 + 2).min(panel_area.height); // +2 for borders
+
+    let picker_area = Rect {
+        x: panel_area.x,
+        y: panel_area.y + panel_area.height.saturating_sub(picker_height),
+        width: panel_area.width,
+        height: picker_height,
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Session type ",
+            Style::new()
+                .fg(theme::primary())
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(theme::primary()))
+        .style(Style::new().bg(theme::surface()));
+
+    let inner = block.inner(picker_area);
+    frame.render_widget(Clear, picker_area);
+    frame.render_widget(block, picker_area);
+
+    let lines: Vec<Line> = app
+        .picker_types
+        .iter()
+        .enumerate()
+        .map(|(i, (label, cmd))| {
+            let is_selected = i == app.picker_cursor;
+            let prefix = if is_selected { "> " } else { "  " };
+            let style = if is_selected {
+                Style::new()
+                    .fg(theme::primary())
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::new().fg(theme::text())
+            };
+            // Show the command alongside the label for concrete types.
+            let text = match cmd {
+                Some(c) => format!("{prefix}{label}  ({c})"),
+                None => format!("{prefix}{label}"),
+            };
+            Line::from(Span::styled(text, style))
         })
         .collect();
 
