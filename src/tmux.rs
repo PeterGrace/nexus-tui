@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use color_eyre::eyre::{bail, WrapErr};
 use color_eyre::Result;
 
-use crate::types::{TmuxSessionInfo, TmuxSessionStatus};
+use crate::types::{CursorPos, TmuxSessionInfo, TmuxSessionStatus};
 
 // ---------------------------------------------------------------------------
 // SendKeysArgs — type-safe tmux send-keys arguments
@@ -30,6 +30,10 @@ pub struct TmuxManager {
 }
 
 impl TmuxManager {
+    /// Scrollback lines captured by [`capture_pane`](Self::capture_pane) (`-S -<N>`).
+    /// Also used to map the pane cursor onto the captured text.
+    pub const CAPTURE_SCROLLBACK_LINES: u16 = 500;
+
     pub fn new(socket_name: &str) -> Self {
         Self {
             socket_name: socket_name.to_string(),
@@ -213,6 +217,7 @@ impl TmuxManager {
     /// escapes, `-N` preserves alternate screen content.
     pub fn capture_pane(&self, session_name: &str) -> Result<String> {
         Self::validate_target(session_name)?;
+        let scrollback = format!("-{}", Self::CAPTURE_SCROLLBACK_LINES);
         let output = Command::new("tmux")
             .args(["-L", &self.socket_name])
             .args([
@@ -223,7 +228,7 @@ impl TmuxManager {
                 "-e",
                 "-N",
                 "-S",
-                "-500",
+                &scrollback,
             ])
             .stderr(Stdio::null())
             .output()
@@ -237,6 +242,53 @@ impl TmuxManager {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Read the pane cursor position and map it onto the captured text.
+    ///
+    /// `capture-pane` omits the cursor, so we query it separately. Returns a
+    /// [`CursorPos`] whose `line` is the cursor's index within the text produced
+    /// by [`capture_pane`](Self::capture_pane): scrollback rows captured above
+    /// the visible pane (`min(CAPTURE_SCROLLBACK_LINES, history_size)`) plus the
+    /// cursor's row within the visible pane (`cursor_y`). Anchoring from the top
+    /// keeps it correct even when tmux trims trailing blank rows.
+    pub fn pane_cursor(&self, session_name: &str) -> Result<CursorPos> {
+        Self::validate_target(session_name)?;
+        let output = Command::new("tmux")
+            .args(["-L", &self.socket_name])
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                session_name,
+                "#{cursor_x} #{cursor_y} #{history_size} #{cursor_flag}",
+            ])
+            .stderr(Stdio::null())
+            .output()
+            .wrap_err("failed to run tmux display-message")?;
+
+        if !output.status.success() {
+            bail!(
+                "tmux display-message exited with status {} for '{}'",
+                output.status,
+                session_name
+            );
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut fields = text.split_whitespace();
+        let x: u16 = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let cursor_y: u16 = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let history: u16 = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        // cursor_flag is 1 when the cursor is visible; assume visible if absent.
+        let visible = fields.next().map(|v| v == "1").unwrap_or(true);
+
+        let scrollback = Self::CAPTURE_SCROLLBACK_LINES.min(history);
+        Ok(CursorPos {
+            x,
+            line: scrollback.saturating_add(cursor_y),
+            visible,
+        })
     }
 
     /// Lightweight text-only capture of the last N lines of a pane.

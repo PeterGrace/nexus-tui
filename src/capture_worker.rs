@@ -7,22 +7,26 @@ use ratatui::text::Text;
 
 use crate::ansi::sanitize_ansi;
 use crate::tmux::TmuxManager;
+use crate::types::CursorPos;
+
+/// A captured frame: the parsed terminal text plus the cursor position, if known.
+pub type LiveFrame = (Text<'static>, Option<CursorPos>);
 
 /// Spawn the capture worker thread.
 ///
 /// Returns channels for communicating with the worker:
 /// - `session_tx`: send session names to capture (empty string = stop)
-/// - `content_rx`: receive parsed `Text<'static>` (None = session gone)
+/// - `content_rx`: receive a parsed [`LiveFrame`] (None = session gone)
 /// - `nudge_tx`: send after forwarding a key to wake the worker immediately
 pub fn spawn(
     tmux: TmuxManager,
 ) -> (
     mpsc::Sender<String>,
-    mpsc::Receiver<Option<Text<'static>>>,
+    mpsc::Receiver<Option<LiveFrame>>,
     mpsc::Sender<()>,
 ) {
     let (session_tx, session_rx) = mpsc::channel::<String>();
-    let (content_tx, content_rx) = mpsc::channel::<Option<Text<'static>>>();
+    let (content_tx, content_rx) = mpsc::channel::<Option<LiveFrame>>();
     let (nudge_tx, nudge_rx) = mpsc::channel::<()>();
 
     std::thread::Builder::new()
@@ -38,11 +42,13 @@ pub fn spawn(
 fn capture_loop(
     tmux: TmuxManager,
     session_rx: mpsc::Receiver<String>,
-    content_tx: mpsc::Sender<Option<Text<'static>>>,
+    content_tx: mpsc::Sender<Option<LiveFrame>>,
     nudge_rx: mpsc::Receiver<()>,
 ) {
     let mut current_session = String::new();
     let mut last_raw: Vec<u8> = Vec::new();
+    let mut last_text: Text<'static> = Text::default();
+    let mut last_cursor: Option<CursorPos> = None;
     let mut poll_interval = Duration::from_millis(30);
 
     loop {
@@ -70,18 +76,31 @@ fn capture_loop(
         match tmux.capture_pane(&current_session) {
             Ok(raw) => {
                 let raw_bytes = raw.as_bytes();
-                if raw_bytes != last_raw.as_slice() {
+                let raw_changed = raw_bytes != last_raw.as_slice();
+                if raw_changed {
                     last_raw = raw_bytes.to_vec();
                     // Parse ANSI on the worker thread — main thread receives ready-to-render Text
                     let sanitized = sanitize_ansi(raw_bytes);
                     let mut parsed: Text<'static> = sanitized.into_text().unwrap_or_default();
                     normalize_resets(&mut parsed);
-                    if content_tx.send(Some(parsed)).is_err() {
+                    last_text = parsed;
+                }
+
+                // The cursor isn't part of the capture; query it separately so the
+                // preview can show where the user is editing. A bare cursor move
+                // (arrow keys) leaves the captured text unchanged, so resend the
+                // cached text when only the cursor moved.
+                let cursor = tmux.pane_cursor(&current_session).ok();
+                let cursor_changed = cursor != last_cursor;
+
+                if raw_changed || cursor_changed {
+                    last_cursor = cursor;
+                    if content_tx.send(Some((last_text.clone(), cursor))).is_err() {
                         return; // Main thread dropped receiver
                     }
                     poll_interval = Duration::from_millis(30); // active: fast polling
                 } else {
-                    // Content unchanged — back off
+                    // Nothing changed — back off
                     poll_interval = (poll_interval * 2).min(Duration::from_millis(500));
                 }
             }
@@ -92,6 +111,7 @@ fn capture_loop(
                 }
                 // Stop capturing this session — wait for a new one
                 current_session.clear();
+                last_cursor = None;
                 continue;
             }
         }

@@ -933,14 +933,16 @@ impl App {
                 }
                 self.refresh_path_suggestions();
             }
-            KeyCode::Up | KeyCode::Char('k') if is_cwd && !self.path_suggestions.is_empty() => {
+            // Only arrow keys navigate the suggestion list — j/k would be
+            // swallowed from a path the user is literally typing.
+            KeyCode::Up if is_cwd && !self.path_suggestions.is_empty() => {
                 if self.path_suggestion_cursor == 0 {
                     self.path_suggestion_cursor = self.path_suggestions.len() - 1;
                 } else {
                     self.path_suggestion_cursor -= 1;
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') if is_cwd && !self.path_suggestions.is_empty() => {
+            KeyCode::Down if is_cwd && !self.path_suggestions.is_empty() => {
                 self.path_suggestion_cursor =
                     (self.path_suggestion_cursor + 1) % self.path_suggestions.len();
             }
