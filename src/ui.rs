@@ -137,7 +137,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, elapsed: Duration) {
     // Clamp live_scroll_offset to max scrollable range before reading it
     let inner_height = interactor_area.height.saturating_sub(2); // border top+bottom
     if let Some(ref mut is) = app.interactor_state {
-        if let Some(SessionContent::Live(ref text)) = is.current_content {
+        if let Some(SessionContent::Live { ref text, .. }) = is.current_content {
             let max_offset = (text.lines.len() as u16).saturating_sub(inner_height);
             is.live_scroll_offset = is.live_scroll_offset.min(max_offset);
         }
@@ -162,6 +162,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, elapsed: Duration) {
         .as_ref()
         .map(|is| is.live_scroll_offset)
         .unwrap_or(0);
+    // Only draw the live cursor when the user is interacting with the pane —
+    // not while a modal or the help overlay is up (the cursor would otherwise
+    // show through behind them at a confusing spot).
+    let show_cursor = app.input_mode == InputMode::Normal && !app.show_help;
     widgets::interactor::render_interactor(
         frame,
         interactor_area,
@@ -169,6 +173,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, elapsed: Duration) {
         interactor_session_name,
         log_scroll,
         live_scroll,
+        show_cursor,
     );
 
     // Cache interactor text and render selection highlight

@@ -10,7 +10,7 @@ Nexus gives you a persistent, organized workspace for managing multiple Claude C
 
 ## Features
 
-- **Live terminal preview** — see Claude Code output in real-time without switching windows
+- **Live terminal preview** — see Claude Code output in real-time without switching windows, with a live cursor that tracks where you're typing
 - **Session grouping** — organize sessions by project via config or on-the-fly
 - **8 color themes** — cycle with `Alt+t`, persisted across restarts
 - **Session lifecycle** — create, rename, move, delete, and kill sessions from the TUI or CLI

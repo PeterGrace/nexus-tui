@@ -3,6 +3,7 @@ use std::sync::mpsc;
 use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 use ratatui::text::{Line, Span, Text};
 
+use crate::capture_worker::LiveFrame;
 use crate::conversation;
 use crate::theme;
 use crate::tmux::{alt_key_to_send_args, key_event_to_send_args, TmuxManager};
@@ -14,7 +15,7 @@ use crate::types::*;
 /// and a cloned TmuxManager for send_keys/resize/paste operations.
 pub struct InteractorState {
     tmux: TmuxManager,
-    content_rx: mpsc::Receiver<Option<Text<'static>>>,
+    content_rx: mpsc::Receiver<Option<LiveFrame>>,
     session_tx: mpsc::Sender<String>,
     nudge_tx: mpsc::Sender<()>,
     pub current_content: Option<SessionContent>,
@@ -30,7 +31,7 @@ pub struct InteractorState {
 impl InteractorState {
     pub fn new(
         tmux: TmuxManager,
-        content_rx: mpsc::Receiver<Option<Text<'static>>>,
+        content_rx: mpsc::Receiver<Option<LiveFrame>>,
         session_tx: mpsc::Sender<String>,
         nudge_tx: mpsc::Sender<()>,
     ) -> Self {
@@ -56,8 +57,8 @@ impl InteractorState {
         // Drain all pending messages, keep the latest
         while let Ok(msg) = self.content_rx.try_recv() {
             match msg {
-                Some(text) => {
-                    self.current_content = Some(SessionContent::Live(text));
+                Some((text, cursor)) => {
+                    self.current_content = Some(SessionContent::Live { text, cursor });
                     updated = true;
                 }
                 None => {
@@ -177,10 +178,10 @@ impl InteractorState {
     pub fn handle_mouse_scroll(&mut self, kind: MouseEventKind) {
         let delta: u16 = 3;
         match (&self.current_content, kind) {
-            (Some(SessionContent::Live(_)), MouseEventKind::ScrollUp) => {
+            (Some(SessionContent::Live { .. }), MouseEventKind::ScrollUp) => {
                 self.live_scroll_offset = self.live_scroll_offset.saturating_add(delta);
             }
-            (Some(SessionContent::Live(_)), MouseEventKind::ScrollDown) => {
+            (Some(SessionContent::Live { .. }), MouseEventKind::ScrollDown) => {
                 self.live_scroll_offset = self.live_scroll_offset.saturating_sub(delta);
             }
             (Some(SessionContent::ConversationLog(_)), MouseEventKind::ScrollUp) => {
@@ -255,7 +256,7 @@ impl InteractorState {
 
                 // Shift+Arrow/Page → scroll the live view instead of forwarding to tmux
                 if current_tmux_name.is_some()
-                    && matches!(self.current_content, Some(SessionContent::Live(_)))
+                    && matches!(self.current_content, Some(SessionContent::Live { .. }))
                     && key.modifiers.contains(KeyModifiers::SHIFT)
                 {
                     match key.code {

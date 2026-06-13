@@ -203,10 +203,31 @@ pub enum TmuxSessionStatus {
 // Session content — what the interactor panel displays
 // ---------------------------------------------------------------------------
 
+/// Position of the tmux pane cursor, mapped onto the captured `Text`.
+///
+/// `tmux capture-pane` does not include the cursor, so we query it separately
+/// (`cursor_x`/`cursor_y`/`history_size`/`cursor_flag`) and translate it into a
+/// line index within the captured text. Anchoring `line` from the top of the
+/// capture (scrollback + `cursor_y`) keeps it correct even when tmux trims
+/// trailing blank rows from the capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorPos {
+    /// Column within the pane (0-based).
+    pub x: u16,
+    /// Line index within the captured `Text` (0-based).
+    pub line: u16,
+    /// Whether tmux reports the cursor as visible (DECTCEM set).
+    pub visible: bool,
+}
+
 /// Content to display in the session interactor panel.
 pub enum SessionContent {
     /// Live terminal content, pre-parsed by capture worker thread.
-    Live(Text<'static>),
+    Live {
+        text: Text<'static>,
+        /// Cursor position, if the worker could read it from tmux.
+        cursor: Option<CursorPos>,
+    },
     /// Pre-rendered conversation log from JSONL for sessions without a tmux pane.
     ConversationLog(Text<'static>),
 }

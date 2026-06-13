@@ -19,6 +19,7 @@ pub fn render_interactor(
     session_name: Option<&str>,
     log_scroll_offset: u16,
     live_scroll_offset: u16,
+    show_cursor: bool,
 ) {
     // Small-area guard: don't render in tiny areas
     if area.width < 10 || area.height < 3 {
@@ -44,8 +45,8 @@ pub fn render_interactor(
     frame.render_widget(block, area);
 
     match content {
-        Some(SessionContent::Live(text)) => {
-            render_live(frame, inner, text, live_scroll_offset);
+        Some(SessionContent::Live { text, cursor }) => {
+            render_live(frame, inner, text, live_scroll_offset, *cursor, show_cursor);
         }
         Some(SessionContent::ConversationLog(text)) => {
             render_conversation_log(frame, inner, text, log_scroll_offset);
@@ -59,12 +60,33 @@ pub fn render_interactor(
 /// Render live terminal content from the capture worker.
 ///
 /// Scrolls to the bottom so the input cursor area is always visible.
-fn render_live(frame: &mut Frame, area: Rect, text: &Text<'static>, user_offset: u16) {
+fn render_live(
+    frame: &mut Frame,
+    area: Rect,
+    text: &Text<'static>,
+    user_offset: u16,
+    cursor: Option<CursorPos>,
+    show_cursor: bool,
+) {
     let total_lines = (text.lines.len().min(u16::MAX as usize)) as u16;
     let bottom_pin = total_lines.saturating_sub(area.height);
     let scroll_offset = bottom_pin.saturating_sub(user_offset);
     let paragraph = Paragraph::new(text.clone()).scroll((scroll_offset, 0));
     frame.render_widget(paragraph, area);
+
+    // Place the real terminal cursor on the cell its captured line renders to.
+    // `cursor.line` indexes the same text the Paragraph draws, so it stays
+    // aligned with the underlying character through any scroll or trailing-blank
+    // trimming. Only draw when the target cell is inside the panel.
+    if show_cursor {
+        if let Some(c) = cursor.filter(|c| c.visible) {
+            let row = (c.line as i32) - (scroll_offset as i32);
+            let col = c.x as i32;
+            if row >= 0 && row < area.height as i32 && col >= 0 && col < area.width as i32 {
+                frame.set_cursor_position((area.x + col as u16, area.y + row as u16));
+            }
+        }
+    }
 }
 
 /// Render a pre-rendered conversation log for sessions without a tmux pane.
@@ -110,7 +132,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, None, None, 0, 0);
+                render_interactor(frame, area, None, None, 0, 0, true);
             })
             .unwrap();
     }
@@ -120,11 +142,19 @@ mod tests {
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         let text = Text::raw("Hello from terminal");
-        let content = SessionContent::Live(text);
+        let content = SessionContent::Live { text, cursor: None };
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, Some(&content), Some("test-session"), 0, 0);
+                render_interactor(
+                    frame,
+                    area,
+                    Some(&content),
+                    Some("test-session"),
+                    0,
+                    0,
+                    true,
+                );
             })
             .unwrap();
     }
@@ -145,7 +175,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, Some(&content), Some("old-session"), 0, 0);
+                render_interactor(frame, area, Some(&content), Some("old-session"), 0, 0, true);
             })
             .unwrap();
     }
@@ -158,7 +188,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, Some(&content), None, 0, 0);
+                render_interactor(frame, area, Some(&content), None, 0, 0, true);
             })
             .unwrap();
     }
@@ -170,7 +200,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, None, None, 0, 0);
+                render_interactor(frame, area, None, None, 0, 0, true);
             })
             .unwrap();
     }
@@ -182,7 +212,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = Rect::new(0, 0, 0, 0);
-                render_interactor(frame, area, None, None, 0, 0);
+                render_interactor(frame, area, None, None, 0, 0, true);
             })
             .unwrap();
     }
@@ -205,7 +235,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, Some(&content), None, 10, 0);
+                render_interactor(frame, area, Some(&content), None, 10, 0, true);
             })
             .unwrap();
     }
@@ -217,11 +247,19 @@ mod tests {
         // Create content taller than the viewport so offset has effect
         let lines: Vec<&str> = (0..100).map(|_| "line of output").collect();
         let text = Text::raw(lines.join("\n"));
-        let content = SessionContent::Live(text);
+        let content = SessionContent::Live { text, cursor: None };
         terminal
             .draw(|frame| {
                 let area = frame.area();
-                render_interactor(frame, area, Some(&content), Some("live-session"), 0, 5);
+                render_interactor(
+                    frame,
+                    area,
+                    Some(&content),
+                    Some("live-session"),
+                    0,
+                    5,
+                    true,
+                );
             })
             .unwrap();
     }
