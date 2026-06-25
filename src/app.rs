@@ -1836,6 +1836,11 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn reconcile_tmux_state(&mut self) {
+        // Intentionally does NOT call `tree_state.anchor_to`: `reconcile_recursive`
+        // only mutates session status fields in place — it never reorders, inserts,
+        // or removes rows — so `cursor_index` stays valid and the preview/highlight/
+        // delete-target invariant is undisturbed. If this ever starts restructuring
+        // the tree, route it through `refresh_tree` (or call `anchor_to`) instead.
         let active_names: HashSet<&str> = self
             .tmux_sessions
             .iter()
