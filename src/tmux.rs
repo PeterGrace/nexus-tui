@@ -20,6 +20,21 @@ pub enum SendKeysArgs {
     Named(&'static str),
 }
 
+/// Escape literal text for `tmux send-keys -l`.
+///
+/// tmux parses an argument that is *exactly* `;` as a command separator, even
+/// behind the `-l` (literal) flag — so a lone semicolon keystroke is silently
+/// swallowed instead of being typed. Escaping it as `\;` makes tmux's command
+/// parser unescape it back to a literal `;` before send-keys consumes it. Only
+/// a standalone `;` is affected; an embedded one (e.g. `a;b`) is sent verbatim.
+fn escape_literal_for_send(text: &str) -> &str {
+    if text == ";" {
+        "\\;"
+    } else {
+        text
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TmuxManager
 // ---------------------------------------------------------------------------
@@ -331,7 +346,7 @@ impl TmuxManager {
 
         match args {
             SendKeysArgs::Literal(text) => {
-                cmd.args(["-l", text]);
+                cmd.args(["-l", escape_literal_for_send(text)]);
             }
             SendKeysArgs::Named(key_name) => {
                 cmd.arg(key_name);
@@ -869,6 +884,18 @@ session-c:win3:0:\n";
         assert_ne!(lit, named);
         assert_eq!(lit, SendKeysArgs::Literal("hello".to_string()));
         assert_eq!(named, SendKeysArgs::Named("Enter"));
+    }
+
+    #[test]
+    fn test_escape_literal_for_send_semicolon() {
+        // A standalone semicolon must be escaped so tmux doesn't treat it as a
+        // command separator and swallow the keystroke.
+        assert_eq!(escape_literal_for_send(";"), "\\;");
+        // Embedded semicolons and all other text pass through untouched.
+        assert_eq!(escape_literal_for_send("a;b"), "a;b");
+        assert_eq!(escape_literal_for_send("a"), "a");
+        assert_eq!(escape_literal_for_send("-"), "-");
+        assert_eq!(escape_literal_for_send("\\"), "\\");
     }
 
     // -- Key mapping tests ------------------------------------------------
