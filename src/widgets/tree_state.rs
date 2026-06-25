@@ -80,6 +80,14 @@ fn flatten_tree(
     }
 }
 
+/// Map a flattened node to its selection target.
+fn flat_target(node: &FlatNode) -> SelectionTarget {
+    match &node.node {
+        FlatNodeKind::Group { id, .. } => SelectionTarget::Group(*id),
+        FlatNodeKind::Session { summary } => SelectionTarget::Session(summary.session_id.clone()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TreeState
 // ---------------------------------------------------------------------------
@@ -182,14 +190,46 @@ impl TreeState {
     /// Get the selection target at the current cursor position.
     pub fn selected_target(&mut self, tree: &[TreeNode]) -> Option<SelectionTarget> {
         self.ensure_cache(tree);
-        self.cached_flat
-            .get(self.cursor_index)
-            .map(|n| match &n.node {
-                FlatNodeKind::Group { id, .. } => SelectionTarget::Group(*id),
-                FlatNodeKind::Session { summary } => {
-                    SelectionTarget::Session(summary.session_id.clone())
-                }
-            })
+        self.cached_flat.get(self.cursor_index).map(flat_target)
+    }
+
+    /// Re-anchor the cursor to `target` after the tree changed underneath us.
+    ///
+    /// - If `target` still maps to a visible row, move `cursor_index` there and
+    ///   return a clone of `target`.
+    /// - If `target` is gone (deleted, or hidden inside a collapsed group) or is
+    ///   `None`, clamp `cursor_index` into range and return whatever target now
+    ///   sits under the cursor (or `None` when the tree is empty).
+    ///
+    /// Does NOT change collapse/expand state — a refresh must preserve the
+    /// groups the user collapsed.
+    pub fn anchor_to(
+        &mut self,
+        target: Option<&SelectionTarget>,
+        tree: &[TreeNode],
+    ) -> Option<SelectionTarget> {
+        self.invalidate_cache();
+        self.ensure_cache(tree);
+
+        let count = self.cached_flat.len();
+        if count == 0 {
+            self.cursor_index = 0;
+            return None;
+        }
+
+        // Preview is the source of truth: find the row matching it by ID.
+        if let Some(t) = target {
+            if let Some(i) = self.cached_flat.iter().position(|n| flat_target(n) == *t) {
+                self.cursor_index = i;
+                return Some(t.clone());
+            }
+        }
+
+        // Target gone (or None): clamp and report what's under the cursor.
+        if self.cursor_index >= count {
+            self.cursor_index = count - 1;
+        }
+        self.cached_flat.get(self.cursor_index).map(flat_target)
     }
 
     /// Handle a key event, returning an optional action.
@@ -377,6 +417,90 @@ mod tests {
                 "a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn test_anchor_to_finds_session_by_id() {
+        // Cursor is stale (pointing elsewhere); anchor_to must move it to the
+        // row whose session_id matches the target, regardless of position.
+        let tree = mock::mock_tree();
+        let mut state = TreeState::new(&tree);
+        state.cursor_index = 5; // somewhere unrelated
+
+        // feat/scanner lives at flat index 1 in the all-expanded mock tree.
+        let target = SelectionTarget::Session("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string());
+        let resolved = state.anchor_to(Some(&target), &tree);
+
+        assert_eq!(state.cursor_index, 1);
+        assert_eq!(resolved, Some(target));
+    }
+
+    #[test]
+    fn test_anchor_to_missing_session_clamps_to_neighbor() {
+        // Target was deleted: anchor_to clamps the cursor into range and returns
+        // whatever target now sits under it (a different, surviving target).
+        let tree = mock::mock_tree();
+        let mut state = TreeState::new(&tree);
+        let count = state.visible_nodes(&tree).len();
+        state.cursor_index = 99; // out of bounds, as if rows were removed
+
+        let gone = SelectionTarget::Session("does-not-exist".to_string());
+        let resolved = state.anchor_to(Some(&gone), &tree);
+
+        assert!(
+            state.cursor_index < count,
+            "cursor must be clamped in range"
+        );
+        assert_eq!(state.cursor_index, count - 1);
+        assert_ne!(resolved, Some(gone), "must not return the missing target");
+        assert!(
+            resolved.is_some(),
+            "a surviving neighbor target is returned"
+        );
+    }
+
+    #[test]
+    fn test_anchor_to_does_not_expand_collapsed_group() {
+        // The selected session is hidden inside a collapsed group. anchor_to must
+        // NOT re-expand it; it treats the hidden session as gone and clamps.
+        let tree = mock::mock_tree();
+        let mut state = TreeState::new(&tree);
+        state.toggle_expand(1); // collapse nexus group (hides feat/scanner)
+        assert!(!state.expanded.contains(&1));
+
+        let hidden = SelectionTarget::Session("a1b2c3d4-e5f6-7890-abcd-ef1234567890".to_string());
+        let resolved = state.anchor_to(Some(&hidden), &tree);
+
+        assert!(
+            !state.expanded.contains(&1),
+            "must not auto-expand the group"
+        );
+        assert_ne!(resolved, Some(hidden), "hidden session is not selectable");
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn test_anchor_to_empty_tree_returns_none() {
+        let tree: Vec<TreeNode> = Vec::new();
+        let mut state = TreeState::new(&tree);
+        let target = SelectionTarget::Session("x".to_string());
+        let resolved = state.anchor_to(Some(&target), &tree);
+        assert_eq!(resolved, None);
+        assert_eq!(state.cursor_index, 0);
+    }
+
+    #[test]
+    fn test_anchor_to_finds_group_by_id() {
+        // Group targets re-anchor through the same lookup as sessions.
+        let tree = mock::mock_tree();
+        let mut state = TreeState::new(&tree);
+        state.cursor_index = 4; // somewhere unrelated
+
+        let target = SelectionTarget::Group(1); // nexus group at flat index 0
+        let resolved = state.anchor_to(Some(&target), &tree);
+
+        assert_eq!(state.cursor_index, 0);
+        assert_eq!(resolved, Some(target));
     }
 
     #[test]

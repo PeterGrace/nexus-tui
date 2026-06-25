@@ -1836,6 +1836,11 @@ impl App {
     // -----------------------------------------------------------------------
 
     fn reconcile_tmux_state(&mut self) {
+        // Intentionally does NOT call `tree_state.anchor_to`: `reconcile_recursive`
+        // only mutates session status fields in place — it never reorders, inserts,
+        // or removes rows — so `cursor_index` stays valid and the preview/highlight/
+        // delete-target invariant is undisturbed. If this ever starts restructuring
+        // the tree, route it through `refresh_tree` (or call `anchor_to`) instead.
         let active_names: HashSet<&str> = self
             .tmux_sessions
             .iter()
@@ -1900,7 +1905,23 @@ impl App {
             self.tree = tree;
             self.tree_state.invalidate_cache();
             self.cached_counts = count_sessions(&self.tree);
-            self.refresh_cached_selected();
+
+            // Keep the cursor anchored to the previewed session so the tmux
+            // preview pane and the highlighted row never disagree (and `alt-d`
+            // always deletes what the user sees).
+            let resolved = self
+                .tree_state
+                .anchor_to(self.selection.selected.as_ref(), &self.tree);
+            if resolved != self.selection.selected {
+                // The previewed target was removed/hidden; the cursor landed on
+                // a neighbor. Move the preview to match.
+                self.selection.selected = resolved;
+                self.refresh_cached_selected();
+                self.sync_interactor_to_selection();
+            } else {
+                self.refresh_cached_selected();
+            }
+
             self.dirty = true;
         }
     }
