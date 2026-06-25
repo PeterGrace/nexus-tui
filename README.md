@@ -16,6 +16,7 @@ Nexus gives you a persistent, organized workspace for managing multiple Claude C
 - **Session lifecycle** — create, rename, move, delete, and kill sessions from the TUI or CLI
 - **Worktree isolation** — optionally create a dedicated git worktree per session for branch-level isolation
 - **Claude session resume** — automatically detects Claude Code session IDs so relaunched sessions resume where they left off
+- **Bypass permissions ready** — sessions launch with `--allow-dangerously-skip-permissions`, so you can select "bypass permissions" mode from inside Claude Code (Shift+Tab) when you want it; it is not enabled automatically
 - **CLI + JSON output** — scriptable interface for all operations (`nexus list --json`)
 - **Lazygit integration** — open lazygit in any session's working directory with `Alt+l`
 - **Editor integration** — open your editor in any session's working directory with `Alt+v`

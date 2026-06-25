@@ -69,6 +69,10 @@ impl TmuxManager {
     ///
     /// If `resume_id` is provided, launches `claude --resume <id>` so Claude
     /// Code picks up the previous conversation.
+    ///
+    /// Always passes `--allow-dangerously-skip-permissions` so the session's
+    /// "bypass permissions" mode is selectable from inside Claude Code. This
+    /// only makes the mode available; it does not enable it automatically.
     pub fn launch_claude_session(
         &self,
         name: &str,
@@ -85,6 +89,10 @@ impl TmuxManager {
             "-c",
             cwd,
             "claude",
+            // Make "bypass permissions" mode selectable inside the session
+            // (via Shift+Tab) without forcing it on. This only enables the
+            // option; it does not skip permission checks by itself.
+            "--allow-dangerously-skip-permissions",
         ]);
 
         if let Some(id) = resume_id {
