@@ -173,13 +173,16 @@ impl Database {
 
         let wt_branch = worktree.map(|w| w.branch.as_str());
         let wt_repo = worktree.map(|w| w.repo_root.to_string_lossy().to_string());
+        // Pi can accept a caller-assigned session ID. Reuse the Nexus UUID so
+        // the ID is persisted atomically, before the agent is launched.
+        let agent_session_id = (agent == SessionAgent::Pi).then_some(id.as_str());
 
         self.conn.execute(
             "INSERT INTO sessions
                 (session_id, display_name, cwd, last_active, is_active,
                  tmux_name, status, created_by, created_at,
-                 worktree_branch, worktree_repo_root, agent)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'active', 'nexus', ?6, ?7, ?8, ?9)",
+                 worktree_branch, worktree_repo_root, agent, agent_session_id)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, 'active', 'nexus', ?6, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 name,
@@ -189,7 +192,8 @@ impl Database {
                 now,
                 wt_branch,
                 wt_repo,
-                agent.as_str()
+                agent.as_str(),
+                agent_session_id
             ],
         )?;
 
@@ -677,6 +681,25 @@ mod tests {
         let sessions = db.ungrouped_session_summaries(true).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent, SessionAgent::Codex);
+    }
+
+    #[test]
+    fn test_pi_agent_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_nexus_session_with_agent(
+                "pi-session",
+                "/tmp/project",
+                "pi-session",
+                None,
+                SessionAgent::Pi,
+            )
+            .unwrap();
+
+        let sessions = db.ungrouped_session_summaries(true).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, SessionAgent::Pi);
+        assert_eq!(sessions[0].agent_session_id.as_deref(), Some(id.as_str()));
     }
 
     #[test]

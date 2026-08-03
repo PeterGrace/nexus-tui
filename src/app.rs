@@ -1122,6 +1122,7 @@ impl App {
             let agent = match key.code {
                 KeyCode::Char('c') | KeyCode::Char('C') => Some(SessionAgent::Claude),
                 KeyCode::Char('x') | KeyCode::Char('X') => Some(SessionAgent::Codex),
+                KeyCode::Char('p') | KeyCode::Char('P') => Some(SessionAgent::Pi),
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
                     self.input_context = None;
@@ -1563,13 +1564,15 @@ impl App {
             .db
             .next_unique_tmux_name(&tmux_name, None)
             .unwrap_or(tmux_name);
-        let snapshot = snapshot_agent_session_ids(agent, cwd);
+        let snapshot = (agent != SessionAgent::Pi).then(|| snapshot_agent_session_ids(agent, cwd));
         match self
             .db
             .create_nexus_session_with_agent(name, cwd, &tmux_name, worktree, agent)
         {
             Ok(id) => {
-                self.jsonl_snapshots.insert(id.clone(), snapshot);
+                if let Some(snapshot) = snapshot {
+                    self.jsonl_snapshots.insert(id.clone(), snapshot);
+                }
                 if let Some(gid) = group_id {
                     if let Err(e) = self.db.assign_session_to_group(&id, gid) {
                         self.status_message =
@@ -1577,7 +1580,11 @@ impl App {
                     }
                 }
                 if self.tmux_available {
-                    if let Err(e) = self.tmux.launch_agent_session(&tmux_name, cwd, agent, None) {
+                    let agent_session_id = (agent == SessionAgent::Pi).then_some(id.as_str());
+                    if let Err(e) =
+                        self.tmux
+                            .launch_agent_session(&tmux_name, cwd, agent, agent_session_id)
+                    {
                         self.status_message =
                             Some((format!("tmux launch failed: {e}"), Instant::now()));
                         self.refresh_tree();
@@ -1779,7 +1786,7 @@ impl App {
                 };
 
                 let resume_id = match session.agent {
-                    SessionAgent::Claude | SessionAgent::Codex => {
+                    SessionAgent::Claude | SessionAgent::Codex | SessionAgent::Pi => {
                         session.agent_session_id.as_deref()
                     }
                     SessionAgent::Unknown => None,
@@ -2002,6 +2009,7 @@ impl App {
             let detected = match agent {
                 SessionAgent::Claude => detect_claude_session_id(cwd, snapshot),
                 SessionAgent::Codex => detect_codex_session_id(cwd, snapshot),
+                SessionAgent::Pi => detect_pi_session_id(cwd, snapshot),
                 SessionAgent::Unknown => None,
             };
             if let Some(agent_id) = detected {
@@ -2091,6 +2099,10 @@ fn collect_sessions_needing_detection(tree: &[TreeNode]) -> Vec<(String, Session
             TreeNode::Session(s) => {
                 let missing_id = match s.agent {
                     SessionAgent::Claude | SessionAgent::Codex => s.agent_session_id.is_none(),
+                    // New Nexus-managed Pi sessions receive an ID before launch.
+                    // Detection is retained only to recover legacy/imported rows
+                    // whose agent_session_id is missing.
+                    SessionAgent::Pi => s.agent_session_id.is_none(),
                     SessionAgent::Unknown => false,
                 };
                 if missing_id && s.status != SessionStatus::Dead {
@@ -2115,6 +2127,7 @@ fn snapshot_agent_session_ids(agent: SessionAgent, cwd: &str) -> HashSet<String>
     match agent {
         SessionAgent::Claude => snapshot_jsonl_stems(cwd),
         SessionAgent::Codex => codex_sessions(cwd).into_iter().map(|(id, _)| id).collect(),
+        SessionAgent::Pi => pi_sessions(cwd).into_iter().map(|(id, _)| id).collect(),
         SessionAgent::Unknown => HashSet::new(),
     }
 }
@@ -2173,6 +2186,77 @@ fn codex_sessions(cwd: &str) -> Vec<(String, std::time::SystemTime)> {
 
 fn detect_codex_session_id(cwd: &str, pre_launch: Option<&HashSet<String>>) -> Option<String> {
     let sessions = codex_sessions(cwd);
+    match pre_launch {
+        Some(snapshot) => sessions
+            .into_iter()
+            .find(|(id, _)| !snapshot.contains(id))
+            .map(|(id, _)| id),
+        None => sessions.into_iter().next().map(|(id, _)| id),
+    }
+}
+
+/// Return Pi session IDs for `cwd`, newest first.
+fn pi_sessions(cwd: &str) -> Vec<(String, std::time::SystemTime)> {
+    let root = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PI_CODING_AGENT_DIR")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
+                .map(|agent_dir| agent_dir.join("sessions"))
+        });
+    let Some(root) = root else {
+        return Vec::new();
+    };
+    pi_sessions_in(&root, cwd)
+}
+
+fn pi_sessions_in(root: &std::path::Path, cwd: &str) -> Vec<(String, std::time::SystemTime)> {
+    use std::io::BufRead;
+
+    let mut pending = vec![root.to_path_buf()];
+    let mut sessions = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "jsonl") {
+                continue;
+            }
+            let Ok(file) = std::fs::File::open(&path) else {
+                continue;
+            };
+            let Some(Ok(first_line)) = std::io::BufReader::new(file).lines().next() else {
+                continue;
+            };
+            let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+                continue;
+            };
+            if header["type"].as_str() != Some("session") || header["cwd"].as_str() != Some(cwd) {
+                continue;
+            }
+            let Some(id) = header["id"].as_str() else {
+                continue;
+            };
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            sessions.push((id.to_string(), modified));
+        }
+    }
+    sessions.sort_by_key(|session| std::cmp::Reverse(session.1));
+    sessions
+}
+
+fn detect_pi_session_id(cwd: &str, pre_launch: Option<&HashSet<String>>) -> Option<String> {
+    let sessions = pi_sessions(cwd);
     match pre_launch {
         Some(snapshot) => sessions
             .into_iter()
@@ -2425,5 +2509,28 @@ mod tests {
         assert_eq!(s.status, SessionStatus::Detached);
         assert!(!s.is_active);
         assert!(changed);
+    }
+
+    #[test]
+    fn test_pi_sessions_reads_matching_session_headers_recursively() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("--tmp-project--");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(
+            nested.join("matching.jsonl"),
+            r#"{"type":"session","version":3,"id":"pi-session-id","cwd":"/tmp/project"}
+{"type":"message"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            nested.join("other.jsonl"),
+            r#"{"type":"session","version":3,"id":"other-id","cwd":"/tmp/other"}"#,
+        )
+        .unwrap();
+        std::fs::write(nested.join("malformed.jsonl"), "not json").unwrap();
+
+        let sessions = pi_sessions_in(temp.path(), "/tmp/project");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, "pi-session-id");
     }
 }

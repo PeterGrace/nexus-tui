@@ -1,6 +1,6 @@
 # Nexus
 
-TUI session manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [OpenAI Codex](https://developers.openai.com/codex/cli/).
+TUI session manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenAI Codex](https://developers.openai.com/codex/cli/), and [Pi](https://pi.dev/).
 
 ![CI](https://github.com/markx3/nexus-tui/actions/workflows/ci.yml/badge.svg)
 
@@ -14,9 +14,9 @@ Nexus gives you a persistent, organized workspace for managing multiple coding-a
 - **Session grouping** — organize sessions by project via config or on-the-fly
 - **8 color themes** — cycle with `Alt+t`, persisted across restarts
 - **Session lifecycle** — create, rename, move, delete, and kill sessions from the TUI or CLI
-- **Claude or Codex** — choose which coding agent to run for each new session
+- **Claude, Codex, or Pi** — choose which coding agent to run for each new session
 - **Worktree isolation** — optionally create a dedicated git worktree per session for branch-level isolation
-- **Claude session resume** — automatically detects Claude Code session IDs so relaunched sessions resume where they left off
+- **Session resume** — automatically detects Claude Code, Codex, and Pi session IDs so relaunched sessions resume where they left off
 - **Bypass permissions ready** — sessions launch with `--allow-dangerously-skip-permissions`, so you can select "bypass permissions" mode from inside Claude Code (Shift+Tab) when you want it; it is not enabled automatically
 - **CLI + JSON output** — scriptable interface for all operations (`nexus list --json`)
 - **Lazygit integration** — open lazygit in any session's working directory with `Alt+l`
@@ -27,7 +27,7 @@ Nexus gives you a persistent, organized workspace for managing multiple coding-a
 
 ## Install
 
-Requires [tmux](https://github.com/tmux/tmux) and a [Rust toolchain](https://rustup.rs/).
+Requires [tmux](https://github.com/tmux/tmux), a [Rust toolchain](https://rustup.rs/), and at least one supported coding-agent CLI (`claude`, `codex`, or `pi`) on your `PATH`.
 
 ```sh
 # From GitHub
@@ -52,7 +52,7 @@ Run `nexus` with no arguments to launch the interactive dashboard.
 nexus
 ```
 
-The TUI shows a session tree on the left and a live terminal preview on the right. All Nexus controls use the **Alt+key** namespace — every other key is forwarded directly to the embedded Claude Code session.
+The TUI shows a session tree on the left and a live terminal preview on the right. All Nexus controls use the **Alt+key** namespace — every other key is forwarded directly to the embedded coding-agent session.
 
 ### Keybindings
 
@@ -97,7 +97,8 @@ nexus show <id>                      # Show session details (ID prefix supported
 nexus new <name>                     # Create and launch a new session
 nexus new <name> -c /path -g mygroup # With cwd and group
 nexus new <name> -w                  # Create with an isolated git worktree
-nexus new <name> --agent codex      # Create and launch a Codex session
+nexus new <name> --agent codex       # Create and launch a Codex session
+nexus new <name> --agent pi          # Create and launch a Pi session
 nexus launch <id>                    # Launch/resume a session in tmux
 nexus kill <name>                    # Kill a running tmux session
 nexus groups                         # List configured groups

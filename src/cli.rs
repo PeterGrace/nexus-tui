@@ -6,7 +6,7 @@ use crate::types::SessionAgent;
 #[command(
     name = "nexus",
     version,
-    about = "TUI session manager for Claude Code and Codex"
+    about = "TUI session manager for Claude Code, Codex, and Pi"
 )]
 pub struct Cli {
     #[command(subcommand)]

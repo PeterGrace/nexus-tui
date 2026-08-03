@@ -419,7 +419,7 @@ fn render_confirm(frame: &mut Frame, panel_area: Rect, app: &App) {
         Some(InputContext::ConfirmDeleteSession { .. }) => "Delete this session? (y/n)",
         Some(InputContext::ConfirmDeleteGroup { .. }) => "Delete this group? (y/n)",
         Some(InputContext::NewSessionWorktree { .. }) => "Isolate in git worktree? (y/n)",
-        Some(InputContext::NewSessionAgent { .. }) => "Coding agent: (c) Claude / Code(x)",
+        Some(InputContext::NewSessionAgent { .. }) => "Coding agent: (c) Claude / Code(x) / (p) Pi",
         _ => "Confirm? (y/n)",
     };
 
@@ -696,7 +696,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         ("", "to select and copy text."),
         ("", ""),
         ("", "All other keys are forwarded to"),
-        ("", "the embedded Claude Code session."),
+        ("", "the embedded coding-agent session."),
         ("", ""),
         ("", "macOS: Enable 'Use Option as Meta"),
         ("", "key' in Terminal/iTerm2 settings."),

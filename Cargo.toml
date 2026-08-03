@@ -2,12 +2,12 @@
 name = "nexus"
 version = "0.3.3"
 edition = "2021"
-description = "TUI session manager for Claude Code"
+description = "TUI session manager for Claude Code, Codex, and Pi"
 license = "MIT"
 authors = ["Marcos Felipe Eipper"]
 repository = "https://github.com/markx3/nexus-tui"
 homepage = "https://github.com/markx3/nexus-tui"
-keywords = ["tui", "tmux", "claude", "session-manager", "ratatui"]
+keywords = ["tui", "tmux", "coding-agent", "session-manager", "ratatui"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
 
