@@ -2098,9 +2098,11 @@ fn collect_sessions_needing_detection(tree: &[TreeNode]) -> Vec<(String, Session
         match node {
             TreeNode::Session(s) => {
                 let missing_id = match s.agent {
-                    SessionAgent::Claude | SessionAgent::Codex | SessionAgent::Pi => {
-                        s.agent_session_id.is_none()
-                    }
+                    SessionAgent::Claude | SessionAgent::Codex => s.agent_session_id.is_none(),
+                    // New Nexus-managed Pi sessions receive an ID before launch.
+                    // Detection is retained only to recover legacy/imported rows
+                    // whose agent_session_id is missing.
+                    SessionAgent::Pi => s.agent_session_id.is_none(),
                     SessionAgent::Unknown => false,
                 };
                 if missing_id && s.status != SessionStatus::Dead {
