@@ -122,9 +122,9 @@ fn complete_with_parent(parent_dir: &str, prefix: &str, had_tilde: bool) -> Vec<
 pub fn resolve_directory(input: &str) -> color_eyre::Result<PathBuf> {
     let (expanded, _) = expand_tilde(input);
     let path = Path::new(&expanded);
-    let resolved = path.canonicalize().wrap_err_with(|| {
-        format!("cannot resolve working directory '{}'", path.display())
-    })?;
+    let resolved = path
+        .canonicalize()
+        .wrap_err_with(|| format!("cannot resolve working directory '{}'", path.display()))?;
 
     if !resolved.is_dir() {
         bail!("working directory '{}' is not a directory", path.display());
