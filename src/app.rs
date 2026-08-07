@@ -19,6 +19,7 @@ use crate::config::NexusConfig;
 use crate::db::Database;
 use crate::feedback_scanner;
 use crate::git;
+use crate::pi_session;
 use crate::theme;
 use crate::tmux::{sanitize_tmux_name, TmuxManager};
 use crate::types::*;
@@ -2127,7 +2128,10 @@ fn snapshot_agent_session_ids(agent: SessionAgent, cwd: &str) -> HashSet<String>
     match agent {
         SessionAgent::Claude => snapshot_jsonl_stems(cwd),
         SessionAgent::Codex => codex_sessions(cwd).into_iter().map(|(id, _)| id).collect(),
-        SessionAgent::Pi => pi_sessions(cwd).into_iter().map(|(id, _)| id).collect(),
+        SessionAgent::Pi => pi_session::sessions(cwd)
+            .into_iter()
+            .map(|session| session.id)
+            .collect(),
         SessionAgent::Unknown => HashSet::new(),
     }
 }
@@ -2195,74 +2199,14 @@ fn detect_codex_session_id(cwd: &str, pre_launch: Option<&HashSet<String>>) -> O
     }
 }
 
-/// Return Pi session IDs for `cwd`, newest first.
-fn pi_sessions(cwd: &str) -> Vec<(String, std::time::SystemTime)> {
-    let root = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
-                .map(|agent_dir| agent_dir.join("sessions"))
-        });
-    let Some(root) = root else {
-        return Vec::new();
-    };
-    pi_sessions_in(&root, cwd)
-}
-
-fn pi_sessions_in(root: &std::path::Path, cwd: &str) -> Vec<(String, std::time::SystemTime)> {
-    use std::io::BufRead;
-
-    let mut pending = vec![root.to_path_buf()];
-    let mut sessions = Vec::new();
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            let Ok(file) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let Some(Ok(first_line)) = std::io::BufReader::new(file).lines().next() else {
-                continue;
-            };
-            let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) else {
-                continue;
-            };
-            if header["type"].as_str() != Some("session") || header["cwd"].as_str() != Some(cwd) {
-                continue;
-            }
-            let Some(id) = header["id"].as_str() else {
-                continue;
-            };
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            sessions.push((id.to_string(), modified));
-        }
-    }
-    sessions.sort_by_key(|session| std::cmp::Reverse(session.1));
-    sessions
-}
-
 fn detect_pi_session_id(cwd: &str, pre_launch: Option<&HashSet<String>>) -> Option<String> {
-    let sessions = pi_sessions(cwd);
+    let sessions = pi_session::sessions(cwd);
     match pre_launch {
         Some(snapshot) => sessions
             .into_iter()
-            .find(|(id, _)| !snapshot.contains(id))
-            .map(|(id, _)| id),
-        None => sessions.into_iter().next().map(|(id, _)| id),
+            .find(|session| !snapshot.contains(&session.id))
+            .map(|session| session.id),
+        None => sessions.into_iter().next().map(|session| session.id),
     }
 }
 
@@ -2509,28 +2453,5 @@ mod tests {
         assert_eq!(s.status, SessionStatus::Detached);
         assert!(!s.is_active);
         assert!(changed);
-    }
-
-    #[test]
-    fn test_pi_sessions_reads_matching_session_headers_recursively() {
-        let temp = tempfile::tempdir().unwrap();
-        let nested = temp.path().join("--tmp-project--");
-        std::fs::create_dir(&nested).unwrap();
-        std::fs::write(
-            nested.join("matching.jsonl"),
-            r#"{"type":"session","version":3,"id":"pi-session-id","cwd":"/tmp/project"}
-{"type":"message"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            nested.join("other.jsonl"),
-            r#"{"type":"session","version":3,"id":"other-id","cwd":"/tmp/other"}"#,
-        )
-        .unwrap();
-        std::fs::write(nested.join("malformed.jsonl"), "not json").unwrap();
-
-        let sessions = pi_sessions_in(temp.path(), "/tmp/project");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "pi-session-id");
     }
 }

@@ -10,6 +10,7 @@ pub(crate) mod git;
 #[cfg(test)]
 mod mock;
 mod path_complete;
+mod pi_session;
 mod repo_config;
 mod theme;
 mod time_utils;
