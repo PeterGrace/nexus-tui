@@ -1,5 +1,7 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use color_eyre::eyre::{bail, WrapErr};
 
 /// Expand `~` at the start of a path to the user's home directory.
 /// Returns `(expanded_path, had_tilde)`.
@@ -116,6 +118,21 @@ fn complete_with_parent(parent_dir: &str, prefix: &str, had_tilde: bool) -> Vec<
     matches.into_iter().map(|(_, name)| name).collect()
 }
 
+/// Resolve a user-entered working directory to a canonical absolute path.
+pub fn resolve_directory(input: &str) -> color_eyre::Result<PathBuf> {
+    let (expanded, _) = expand_tilde(input);
+    let path = Path::new(&expanded);
+    let resolved = path
+        .canonicalize()
+        .wrap_err_with(|| format!("cannot resolve working directory '{}'", path.display()))?;
+
+    if !resolved.is_dir() {
+        bail!("working directory '{}' is not a directory", path.display());
+    }
+
+    Ok(resolved)
+}
+
 /// Check if the given path (possibly with `~`) refers to a directory.
 pub fn is_directory(path: &str) -> bool {
     let (expanded, _) = expand_tilde(path);
@@ -199,6 +216,68 @@ mod tests {
             }
             // Just verify it doesn't panic; ordering is best-effort in /tmp
         }
+    }
+
+    #[test]
+    fn test_resolve_directory_without_trailing_slash() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("project");
+        std::fs::create_dir(&directory).unwrap();
+
+        assert_eq!(
+            resolve_directory(directory.to_str().unwrap()).unwrap(),
+            directory.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_resolve_directory_with_trailing_slash() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("project");
+        std::fs::create_dir(&directory).unwrap();
+        let input = format!("{}/", directory.display());
+
+        assert_eq!(
+            resolve_directory(&input).unwrap(),
+            directory.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_resolve_relative_directory_returns_canonical_path() {
+        let temp = tempfile::Builder::new()
+            .prefix("nexus-relative-path-")
+            .tempdir_in(".")
+            .unwrap();
+        let directory = temp.path().join("project");
+        std::fs::create_dir(&directory).unwrap();
+        let current_dir = std::env::current_dir().unwrap();
+        let relative = directory.strip_prefix(current_dir).unwrap();
+        assert!(!relative.is_absolute());
+
+        assert_eq!(
+            resolve_directory(relative.to_str().unwrap()).unwrap(),
+            directory.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn test_resolve_directory_rejects_nonexistent_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+
+        let error = resolve_directory(missing.to_str().unwrap()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("cannot resolve working directory"));
+    }
+
+    #[test]
+    fn test_resolve_directory_rejects_file() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+
+        let error = resolve_directory(file.path().to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("is not a directory"));
     }
 
     #[test]

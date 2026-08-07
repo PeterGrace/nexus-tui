@@ -953,15 +953,9 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                let mut buffer = self.input_buffer.clone();
+                let buffer = self.input_buffer.clone();
                 if buffer.trim().is_empty() {
                     return;
-                }
-                // Expand ~ before passing to process_text_input
-                if is_cwd && (buffer == "~" || buffer.starts_with("~/")) {
-                    if let Some(home) = dirs::home_dir() {
-                        buffer = format!("{}{}", home.display(), &buffer[1..]);
-                    }
                 }
                 self.path_suggestions.clear();
                 self.path_suggestion_cursor = 0;
@@ -1004,16 +998,28 @@ impl App {
                 self.refresh_path_suggestions();
             }
             InputContext::NewSessionCwd { name } => {
+                let cwd = match crate::path_complete::resolve_directory(&buffer) {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(error) => {
+                        self.input_mode = InputMode::TextInput;
+                        self.input_context = Some(InputContext::NewSessionCwd { name });
+                        self.status_message = Some((
+                            format!("invalid working directory: {error}"),
+                            Instant::now(),
+                        ));
+                        return;
+                    }
+                };
                 // If CWD is a git repo, offer worktree isolation
-                if let Some(repo) = git::detect_repo(&buffer) {
+                if let Some(repo) = git::detect_repo(&cwd) {
                     self.input_mode = InputMode::Confirm;
                     self.input_context = Some(InputContext::NewSessionWorktree {
                         name,
-                        cwd: buffer,
+                        cwd,
                         repo_root: repo.root,
                     });
                 } else {
-                    self.transition_to_group_or_create(name, buffer, None);
+                    self.transition_to_group_or_create(name, cwd, None);
                 }
             }
             InputContext::RenameSession { session_id } => {
@@ -2433,6 +2439,73 @@ fn reconcile_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_app(temp: &tempfile::TempDir) -> App {
+        let db_path = temp.path().join("nexus.db");
+        let db = Database::open(&db_path).unwrap();
+        let mut config = NexusConfig::default();
+        config.general.db_path = db_path;
+        App::new(
+            config,
+            Vec::new(),
+            TmuxManager::new("nexus-cwd-resolution-test"),
+            false,
+            Vec::new(),
+            db,
+        )
+    }
+
+    #[test]
+    fn test_new_session_cwd_rejects_invalid_path_without_advancing() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = test_app(&temp);
+        let missing = temp.path().join("project").to_string_lossy().to_string();
+        app.input_mode = InputMode::TextInput;
+        app.input_buffer = missing.clone();
+        app.input_context = Some(InputContext::NewSessionCwd {
+            name: "test-session".to_string(),
+        });
+
+        app.process_text_input(missing.clone());
+
+        assert_eq!(app.input_mode, InputMode::TextInput);
+        assert_eq!(app.input_buffer, missing);
+        assert!(matches!(
+            app.input_context,
+            Some(InputContext::NewSessionCwd { ref name }) if name == "test-session"
+        ));
+        assert!(app
+            .status_message
+            .as_ref()
+            .is_some_and(|(message, _)| message.contains("invalid working directory")));
+    }
+
+    #[test]
+    fn test_new_session_cwd_advances_with_canonical_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("project");
+        std::fs::create_dir(&directory).unwrap();
+        let mut app = test_app(&temp);
+        let input = directory.to_string_lossy().to_string();
+        app.input_mode = InputMode::TextInput;
+        app.input_buffer = input.clone();
+        app.input_context = Some(InputContext::NewSessionCwd {
+            name: "test-session".to_string(),
+        });
+
+        app.process_text_input(input);
+
+        let canonical = directory
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(app.input_mode, InputMode::Confirm);
+        assert!(matches!(
+            app.input_context,
+            Some(InputContext::NewSessionAgent { ref cwd, .. }) if cwd == &canonical
+        ));
+    }
 
     #[test]
     fn test_sanitize_tmux_name_ascii() {

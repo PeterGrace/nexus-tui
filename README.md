@@ -113,6 +113,8 @@ nexus group-create <name>            # Create a new group
 nexus update                         # Update nexus to the latest version
 ```
 
+Session working directories must already exist. Nexus expands `~` and resolves the directory to a canonical absolute path before creating a session; invalid paths are rejected instead of falling back to Nexus's startup directory.
+
 ## Configuration
 
 Nexus reads its config from `~/.config/nexus/config.toml`. All fields are optional.

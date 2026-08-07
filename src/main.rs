@@ -83,6 +83,8 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| "/tmp".to_string())
             });
+            let cwd = path_complete::resolve_directory(&cwd)?;
+            let cwd = cwd.to_string_lossy().into_owned();
 
             let wt_info = if worktree {
                 let repo = git::detect_repo(&cwd).ok_or_else(|| {
