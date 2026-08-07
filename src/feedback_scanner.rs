@@ -74,6 +74,99 @@ fn has_halt_pattern(text: &str) -> bool {
         .any(|line| HALT_PATTERNS.iter().any(|p| line.contains(p)))
 }
 
+const PI_INPUT_PHRASES: &[&str] = &[
+    "please review",
+    "does this look",
+    "what do you think",
+    "would you like",
+    "do you want",
+    "should i",
+    "shall i",
+    "please confirm",
+    "can you confirm",
+    "let me know",
+    "which option",
+    "which approach",
+    "choose one",
+    "select one",
+];
+
+fn prose_without_fences(text: &str) -> String {
+    let mut inside_fence = false;
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                inside_fence = !inside_fence;
+                return None;
+            }
+            (!inside_fence).then_some(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn requests_input(text: &str) -> bool {
+    let prose = prose_without_fences(text);
+    let lowercase = prose.to_lowercase();
+    PI_INPUT_PHRASES
+        .iter()
+        .any(|phrase| lowercase.contains(phrase))
+        || prose
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .is_some_and(|line| line.trim_end().ends_with('?'))
+}
+
+fn pi_is_working(text: &str) -> bool {
+    text.lines().any(|line| line.contains("Working..."))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum PiPhase {
+    #[default]
+    Unknown,
+    Working,
+    Idle,
+    Attention,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PiAttentionState {
+    phase: PiPhase,
+    evaluation_pending: bool,
+}
+
+impl PiAttentionState {
+    /// Observe the pane state and return whether JSONL evaluation is due.
+    fn observe(&mut self, working: bool) -> bool {
+        if working {
+            self.phase = PiPhase::Working;
+            self.evaluation_pending = false;
+            return false;
+        }
+        if matches!(self.phase, PiPhase::Unknown | PiPhase::Working) {
+            self.phase = PiPhase::Idle;
+            self.evaluation_pending = true;
+        }
+        self.evaluation_pending
+    }
+
+    fn resolve(&mut self, matched: bool) {
+        self.phase = if matched {
+            PiPhase::Attention
+        } else {
+            PiPhase::Idle
+        };
+        self.evaluation_pending = false;
+    }
+
+    fn is_attention(self) -> bool {
+        self.phase == PiPhase::Attention
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +220,87 @@ mod tests {
                     line 6\nline 7\nline 8\n\
                     Allow? (Y)es | (N)o | (A)lways\nline 10\n";
         assert!(has_halt_pattern(text));
+    }
+
+    #[test]
+    fn detects_pi_input_request_phrases_case_insensitively() {
+        for text in [
+            "Please review the plan.",
+            "DOES THIS LOOK right",
+            "What do you think",
+            "Would you like me to continue",
+            "Do you want option A",
+            "Should I implement it",
+            "Shall I proceed",
+            "Please confirm the scope",
+            "Can you confirm the path",
+            "Let me know which you prefer",
+            "Which option works best",
+            "Which approach should we take",
+            "Choose one of these",
+            "Select one of these",
+        ] {
+            assert!(requests_input(text), "expected match for {text:?}");
+        }
+    }
+
+    #[test]
+    fn detects_final_prose_question() {
+        assert!(requests_input("Implementation is ready.\nProceed with it?"));
+    }
+
+    #[test]
+    fn ignores_non_question_completion() {
+        assert!(!requests_input(
+            "Implementation is complete and all tests pass."
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_the_pi_working_status_text() {
+        assert!(pi_is_working("⠴ Working..."));
+        assert!(!pi_is_working("Implementation is complete."));
+    }
+
+    #[test]
+    fn ignores_questions_confined_to_fenced_code() {
+        let text = "Example:\n```text\nDoes this look right?\n```\nThe example is complete.";
+        assert!(!requests_input(text));
+    }
+
+    #[test]
+    fn unknown_idle_requests_one_recovery_evaluation() {
+        let mut state = PiAttentionState::default();
+        assert!(state.observe(false));
+        state.resolve(false);
+        assert!(!state.observe(false));
+    }
+
+    #[test]
+    fn working_to_idle_requests_one_evaluation() {
+        let mut state = PiAttentionState::default();
+        assert!(!state.observe(true));
+        assert!(state.observe(false));
+        state.resolve(false);
+        assert!(!state.observe(false));
+    }
+
+    #[test]
+    fn failed_evaluation_remains_pending() {
+        let mut state = PiAttentionState::default();
+        assert!(state.observe(false));
+        assert!(state.observe(false));
+    }
+
+    #[test]
+    fn attention_persists_until_working_resumes() {
+        let mut state = PiAttentionState::default();
+        assert!(state.observe(false));
+        state.resolve(true);
+        assert!(state.is_attention());
+        assert!(!state.observe(false));
+        assert!(state.is_attention());
+        assert!(!state.observe(true));
+        assert!(!state.is_attention());
     }
 }
