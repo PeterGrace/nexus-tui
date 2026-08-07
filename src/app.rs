@@ -126,6 +126,7 @@ pub struct App {
     // Feedback scanner: sessions needing user attention (tmux session names)
     pub(crate) attention_sessions: HashSet<String>,
     feedback_rx: Option<mpsc::Receiver<HashSet<String>>>,
+    feedback_targets_tx: Option<mpsc::Sender<Vec<feedback_scanner::FeedbackTarget>>>,
     pub(crate) attention_effects: HashMap<String, Effect>,
     // Update checker: is a newer version available upstream?
     pub(crate) update_available: bool,
@@ -202,17 +203,17 @@ impl App {
         let cached_counts = count_sessions(&tree);
 
         // Spawn capture worker and feedback scanner if tmux is available
-        let (interactor_state, feedback_rx) = if tmux_available {
+        let (interactor_state, feedback_rx, feedback_targets_tx) = if tmux_available {
             // Configure true color + keybindings (no-op if server not yet started)
             if !tmux_sessions.is_empty() {
                 let _ = tmux.configure_server();
             }
             let (session_tx, content_rx, nudge_tx) = capture_worker::spawn(tmux.clone());
             let is = InteractorState::new(tmux.clone(), content_rx, session_tx, nudge_tx);
-            let frx = feedback_scanner::spawn(tmux.clone());
-            (Some(is), Some(frx))
+            let handle = feedback_scanner::spawn(tmux.clone());
+            (Some(is), Some(handle.attention_rx), Some(handle.targets_tx))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Spawn background update checker
@@ -270,6 +271,7 @@ impl App {
             area_logo_border_y: 0,
             attention_sessions: HashSet::new(),
             feedback_rx,
+            feedback_targets_tx,
             attention_effects: HashMap::new(),
             pending_wt_create: None,
             pending_wt_teardown: None,
@@ -280,6 +282,7 @@ impl App {
         // Wire up interactor to the restored session (if any)
         app.refresh_cached_selected();
         app.sync_interactor_to_selection();
+        app.sync_feedback_targets();
 
         app
     }
@@ -2051,11 +2054,18 @@ impl App {
                 self.refresh_cached_selected();
             }
 
+            self.sync_feedback_targets();
             self.dirty = true;
         }
     }
 
     /// Rebuild attention effects with the current theme's hazard color.
+    fn sync_feedback_targets(&self) {
+        if let Some(tx) = &self.feedback_targets_tx {
+            let _ = tx.send(collect_feedback_targets(&self.tree));
+        }
+    }
+
     fn rebuild_attention_effects(&mut self) {
         self.attention_effects.clear();
         for name in &self.attention_sessions {
@@ -2119,6 +2129,36 @@ fn collect_sessions_needing_detection(tree: &[TreeNode]) -> Vec<(String, Session
             TreeNode::Group(g) => {
                 result.extend(collect_sessions_needing_detection(&g.children));
             }
+        }
+    }
+    result
+}
+
+fn collect_feedback_targets(tree: &[TreeNode]) -> Vec<feedback_scanner::FeedbackTarget> {
+    let mut result = Vec::new();
+    for node in tree {
+        match node {
+            TreeNode::Group(group) => result.extend(collect_feedback_targets(&group.children)),
+            TreeNode::Session(session) if session.status != SessionStatus::Dead => {
+                let Some(tmux_name) = session.tmux_name.clone() else {
+                    continue;
+                };
+                let pi_session_path = if session.agent == SessionAgent::Pi {
+                    session
+                        .cwd
+                        .as_deref()
+                        .zip(session.agent_session_id.as_deref())
+                        .and_then(|(cwd, id)| pi_session::find_path(&cwd.to_string_lossy(), id))
+                } else {
+                    None
+                };
+                result.push(feedback_scanner::FeedbackTarget {
+                    tmux_name,
+                    agent: session.agent,
+                    pi_session_path,
+                });
+            }
+            TreeNode::Session(_) => {}
         }
     }
     result
@@ -2453,5 +2493,29 @@ mod tests {
         assert_eq!(s.status, SessionStatus::Detached);
         assert!(!s.is_active);
         assert!(changed);
+    }
+
+    #[test]
+    fn collect_feedback_targets_includes_only_live_named_sessions() {
+        let mut tree = crate::mock::mock_tree();
+        let TreeNode::Group(first_group) = &mut tree[0] else {
+            panic!("first fixture node must be a group");
+        };
+        let TreeNode::Session(first_session) = &mut first_group.children[0] else {
+            panic!("first fixture child must be a session");
+        };
+        first_session.agent = SessionAgent::Codex;
+        first_session.agent_session_id = Some("codex-id".to_string());
+
+        let targets = collect_feedback_targets(&tree);
+
+        assert_eq!(targets.len(), 3);
+        let target = targets
+            .iter()
+            .find(|target| target.tmux_name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+            .unwrap();
+        assert_eq!(target.agent, SessionAgent::Codex);
+        assert_eq!(target.pi_session_path, None);
+        assert!(targets.iter().all(|target| !target.tmux_name.is_empty()));
     }
 }

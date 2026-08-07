@@ -5,14 +5,19 @@
 //! halt signatures (permission prompts, MCP confirmations) and sends the set
 //! of halted session names to the main thread via mpsc channel.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use crate::pi_session;
 use crate::tmux::TmuxManager;
+use crate::types::SessionAgent;
 
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const CAPTURE_LINES: u32 = 20;
+
+type PiStates = HashMap<String, (Option<PathBuf>, PiAttentionState)>;
 
 /// Known halt patterns — substring matches against each captured line.
 ///
@@ -27,43 +32,104 @@ const HALT_PATTERNS: &[&str] = &[
     "Enter to select",
 ];
 
-/// Spawn the feedback scanner thread.
-///
-/// Returns a receiver that yields `HashSet<String>` of tmux session names
-/// currently in a halt state. Only sends when the set changes.
-pub fn spawn(tmux: TmuxManager) -> mpsc::Receiver<HashSet<String>> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("nexus-feedback".to_string())
-        .spawn(move || scanner_loop(tmux, tx))
-        .expect("failed to spawn feedback scanner thread");
-    rx
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FeedbackTarget {
+    pub(crate) tmux_name: String,
+    pub(crate) agent: SessionAgent,
+    pub(crate) pi_session_path: Option<PathBuf>,
 }
 
-fn scanner_loop(tmux: TmuxManager, tx: mpsc::Sender<HashSet<String>>) {
-    let mut last_set: HashSet<String> = HashSet::new();
+pub(crate) struct FeedbackScannerHandle {
+    pub(crate) attention_rx: mpsc::Receiver<HashSet<String>>,
+    pub(crate) targets_tx: mpsc::Sender<Vec<FeedbackTarget>>,
+}
+
+/// Spawn the feedback scanner thread.
+///
+/// Returns the attention receiver plus a target-update sender.
+pub(crate) fn spawn(tmux: TmuxManager) -> FeedbackScannerHandle {
+    let (attention_tx, attention_rx) = mpsc::channel();
+    let (targets_tx, targets_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("nexus-feedback".to_string())
+        .spawn(move || scanner_loop(tmux, attention_tx, targets_rx))
+        .expect("failed to spawn feedback scanner thread");
+    FeedbackScannerHandle {
+        attention_rx,
+        targets_tx,
+    }
+}
+
+fn scanner_loop(
+    tmux: TmuxManager,
+    tx: mpsc::Sender<HashSet<String>>,
+    targets_rx: mpsc::Receiver<Vec<FeedbackTarget>>,
+) {
+    let mut last_set = HashSet::new();
+    let mut targets = HashMap::<String, FeedbackTarget>::new();
+    let mut pi_states = PiStates::new();
 
     loop {
-        let mut halted = HashSet::new();
+        if let Some(latest) = targets_rx.try_iter().last() {
+            targets = latest
+                .into_iter()
+                .map(|target| (target.tmux_name.clone(), target))
+                .collect();
+            sync_pi_states(&targets, &mut pi_states);
+        }
 
+        let mut halted = HashSet::new();
         if let Ok(sessions) = tmux.list_sessions() {
+            let live: HashSet<&str> = sessions
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect();
+            pi_states.retain(|name, _| live.contains(name.as_str()));
+
             for session in &sessions {
-                if let Ok(text) = tmux.capture_pane_tail(&session.session_id, CAPTURE_LINES) {
-                    if has_halt_pattern(&text) {
-                        halted.insert(session.session_id.clone());
+                let Ok(text) = tmux.capture_pane_tail(&session.session_id, CAPTURE_LINES) else {
+                    continue;
+                };
+
+                // Preserve the existing terminal-signature behavior.
+                if has_halt_pattern(&text) {
+                    halted.insert(session.session_id.clone());
+                }
+
+                let Some(target) = targets.get(&session.session_id) else {
+                    continue;
+                };
+                if target.agent != SessionAgent::Pi {
+                    continue;
+                }
+                let Some((path, state)) = pi_states.get_mut(&session.session_id) else {
+                    continue;
+                };
+                if state.observe(pi_is_working(&text)) {
+                    let evaluation = path
+                        .as_deref()
+                        .map(pi_session::latest_assistant_text)
+                        .transpose();
+                    match evaluation {
+                        Ok(Some(Some(assistant_text))) => {
+                            state.resolve(requests_input(&assistant_text));
+                        }
+                        Ok(Some(None)) => state.resolve(false),
+                        Ok(None) | Err(_) => {}
                     }
+                }
+                if state.is_attention() {
+                    halted.insert(session.session_id.clone());
                 }
             }
         }
 
-        // Only send if the set changed
         if halted != last_set {
             last_set.clone_from(&halted);
             if tx.send(halted).is_err() {
-                return; // Main thread dropped receiver
+                return;
             }
         }
-
         std::thread::sleep(SCAN_INTERVAL);
     }
 }
@@ -93,17 +159,18 @@ const PI_INPUT_PHRASES: &[&str] = &[
 
 fn prose_without_fences(text: &str) -> String {
     let mut inside_fence = false;
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-                inside_fence = !inside_fence;
-                return None;
-            }
-            (!inside_fence).then_some(line)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut prose = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            inside_fence = !inside_fence;
+            continue;
+        }
+        if !inside_fence {
+            prose.push(line);
+        }
+    }
+    prose.join("\n")
 }
 
 fn requests_input(text: &str) -> bool {
@@ -136,6 +203,32 @@ enum PiPhase {
 struct PiAttentionState {
     phase: PiPhase,
     evaluation_pending: bool,
+}
+
+fn sync_pi_states(targets: &HashMap<String, FeedbackTarget>, states: &mut PiStates) {
+    states.retain(|name, _| {
+        targets
+            .get(name)
+            .is_some_and(|target| target.agent == SessionAgent::Pi)
+    });
+    for target in targets
+        .values()
+        .filter(|target| target.agent == SessionAgent::Pi)
+    {
+        match states.get_mut(&target.tmux_name) {
+            Some((path, state)) if *path != target.pi_session_path => {
+                *path = target.pi_session_path.clone();
+                *state = PiAttentionState::default();
+            }
+            Some(_) => {}
+            None => {
+                states.insert(
+                    target.tmux_name.clone(),
+                    (target.pi_session_path.clone(), PiAttentionState::default()),
+                );
+            }
+        }
+    }
 }
 
 impl PiAttentionState {
@@ -302,5 +395,38 @@ mod tests {
         assert!(state.is_attention());
         assert!(!state.observe(true));
         assert!(!state.is_attention());
+    }
+
+    #[test]
+    fn sync_pi_states_removes_missing_targets_and_resets_changed_paths() {
+        let old_path = PathBuf::from("old.jsonl");
+        let new_path = PathBuf::from("new.jsonl");
+        let mut states = HashMap::from([
+            (
+                "changed".to_string(),
+                (
+                    Some(old_path),
+                    PiAttentionState {
+                        phase: PiPhase::Attention,
+                        evaluation_pending: false,
+                    },
+                ),
+            ),
+            ("removed".to_string(), (None, PiAttentionState::default())),
+        ]);
+        let targets = HashMap::from([(
+            "changed".to_string(),
+            FeedbackTarget {
+                tmux_name: "changed".to_string(),
+                agent: SessionAgent::Pi,
+                pi_session_path: Some(new_path.clone()),
+            },
+        )]);
+
+        sync_pi_states(&targets, &mut states);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states["changed"].0, Some(new_path));
+        assert_eq!(states["changed"].1.phase, PiPhase::Unknown);
     }
 }
