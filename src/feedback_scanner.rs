@@ -78,51 +78,54 @@ fn scanner_loop(
             sync_pi_states(&targets, &mut pi_states);
         }
 
-        let mut halted = HashSet::new();
-        if let Ok(sessions) = tmux.list_sessions() {
-            let live: HashSet<&str> = sessions
-                .iter()
-                .map(|session| session.session_id.as_str())
-                .collect();
-            pi_states.retain(|name, _| live.contains(name.as_str()));
+        let halted = match tmux.list_sessions() {
+            Ok(sessions) => {
+                let live: HashSet<&str> = sessions
+                    .iter()
+                    .map(|session| session.session_id.as_str())
+                    .collect();
+                let mut halted = begin_scan_cycle(&last_set, Some(&live), &targets, &mut pi_states);
 
-            for session in &sessions {
-                let Ok(text) = tmux.capture_pane_tail(&session.session_id, CAPTURE_LINES) else {
-                    continue;
-                };
+                for session in &sessions {
+                    let Ok(text) = tmux.capture_pane_tail(&session.session_id, CAPTURE_LINES)
+                    else {
+                        continue;
+                    };
 
-                // Preserve the existing terminal-signature behavior.
-                if has_halt_pattern(&text) {
-                    halted.insert(session.session_id.clone());
-                }
+                    let mut session_halted = has_halt_pattern(&text);
 
-                let Some(target) = targets.get(&session.session_id) else {
-                    continue;
-                };
-                if target.agent != SessionAgent::Pi {
-                    continue;
-                }
-                let Some((path, state)) = pi_states.get_mut(&session.session_id) else {
-                    continue;
-                };
-                if state.observe(pi_is_working(&text)) {
-                    let evaluation = path
-                        .as_deref()
-                        .map(pi_session::latest_assistant_text)
-                        .transpose();
-                    match evaluation {
-                        Ok(Some(Some(assistant_text))) => {
-                            state.resolve(requests_input(&assistant_text));
+                    if let Some(target) = targets.get(&session.session_id) {
+                        if target.agent == SessionAgent::Pi {
+                            if let Some((path, state)) = pi_states.get_mut(&session.session_id) {
+                                if state.observe(pi_is_working(&text)) {
+                                    let evaluation = path
+                                        .as_deref()
+                                        .map(pi_session::latest_assistant_text)
+                                        .transpose();
+                                    match evaluation {
+                                        Ok(Some(Some(assistant_text))) => {
+                                            state.resolve(requests_input(&assistant_text));
+                                        }
+                                        Ok(Some(None)) => state.resolve(false),
+                                        Ok(None) | Err(_) => {}
+                                    }
+                                }
+                                session_halted |= state.is_attention();
+                            }
                         }
-                        Ok(Some(None)) => state.resolve(false),
-                        Ok(None) | Err(_) => {}
+                    }
+
+                    if session_halted {
+                        halted.insert(session.session_id.clone());
+                    } else {
+                        halted.remove(&session.session_id);
                     }
                 }
-                if state.is_attention() {
-                    halted.insert(session.session_id.clone());
-                }
+
+                halted
             }
-        }
+            Err(_) => begin_scan_cycle(&last_set, None, &targets, &mut pi_states),
+        };
 
         if halted != last_set {
             last_set.clone_from(&halted);
@@ -229,6 +232,57 @@ fn sync_pi_states(targets: &HashMap<String, FeedbackTarget>, states: &mut PiStat
             }
         }
     }
+}
+
+fn sync_live_pi_states(
+    live: &HashSet<&str>,
+    targets: &HashMap<String, FeedbackTarget>,
+    states: &mut PiStates,
+) {
+    states.retain(|name, _| {
+        live.contains(name.as_str())
+            && targets
+                .get(name)
+                .is_some_and(|target| target.agent == SessionAgent::Pi)
+    });
+    for name in live {
+        let Some(target) = targets.get(*name) else {
+            continue;
+        };
+        if target.agent != SessionAgent::Pi {
+            continue;
+        }
+        match states.get_mut(*name) {
+            Some((path, state)) if *path != target.pi_session_path => {
+                *path = target.pi_session_path.clone();
+                *state = PiAttentionState::default();
+            }
+            Some(_) => {}
+            None => {
+                states.insert(
+                    target.tmux_name.clone(),
+                    (target.pi_session_path.clone(), PiAttentionState::default()),
+                );
+            }
+        }
+    }
+}
+
+fn begin_scan_cycle(
+    last_set: &HashSet<String>,
+    live: Option<&HashSet<&str>>,
+    targets: &HashMap<String, FeedbackTarget>,
+    states: &mut PiStates,
+) -> HashSet<String> {
+    let Some(live) = live else {
+        return last_set.clone();
+    };
+    sync_live_pi_states(live, targets, states);
+    last_set
+        .iter()
+        .filter(|name| live.contains(name.as_str()))
+        .cloned()
+        .collect()
 }
 
 impl PiAttentionState {
@@ -428,5 +482,84 @@ mod tests {
         assert_eq!(states.len(), 1);
         assert_eq!(states["changed"].0, Some(new_path));
         assert_eq!(states["changed"].1.phase, PiPhase::Unknown);
+    }
+
+    #[test]
+    fn begin_scan_cycle_preserves_published_attention_when_listing_fails() {
+        let path = PathBuf::from("session.jsonl");
+        let targets = HashMap::from([(
+            "pi-live".to_string(),
+            FeedbackTarget {
+                tmux_name: "pi-live".to_string(),
+                agent: SessionAgent::Pi,
+                pi_session_path: Some(path.clone()),
+            },
+        )]);
+        let last_set = HashSet::from(["pi-live".to_string()]);
+        let mut states = HashMap::from([(
+            "pi-live".to_string(),
+            (
+                Some(path),
+                PiAttentionState {
+                    phase: PiPhase::Attention,
+                    evaluation_pending: false,
+                },
+            ),
+        )]);
+
+        let halted = begin_scan_cycle(&last_set, None, &targets, &mut states);
+
+        assert_eq!(halted, last_set);
+        assert_eq!(states["pi-live"].1.phase, PiPhase::Attention);
+    }
+
+    #[test]
+    fn begin_scan_cycle_preserves_live_attention_before_capture_refresh() {
+        let path = PathBuf::from("session.jsonl");
+        let targets = HashMap::from([(
+            "pi-live".to_string(),
+            FeedbackTarget {
+                tmux_name: "pi-live".to_string(),
+                agent: SessionAgent::Pi,
+                pi_session_path: Some(path.clone()),
+            },
+        )]);
+        let live = HashSet::from(["pi-live"]);
+        let last_set = HashSet::from(["pi-live".to_string()]);
+        let mut states = HashMap::from([(
+            "pi-live".to_string(),
+            (
+                Some(path),
+                PiAttentionState {
+                    phase: PiPhase::Attention,
+                    evaluation_pending: false,
+                },
+            ),
+        )]);
+
+        let halted = begin_scan_cycle(&last_set, Some(&live), &targets, &mut states);
+
+        assert_eq!(halted, last_set);
+    }
+
+    #[test]
+    fn sync_live_pi_states_recreates_still_targeted_live_sessions() {
+        let path = PathBuf::from("session.jsonl");
+        let targets = HashMap::from([(
+            "pi-live".to_string(),
+            FeedbackTarget {
+                tmux_name: "pi-live".to_string(),
+                agent: SessionAgent::Pi,
+                pi_session_path: Some(path.clone()),
+            },
+        )]);
+        let live = HashSet::from(["pi-live"]);
+        let mut states = PiStates::new();
+
+        sync_live_pi_states(&live, &targets, &mut states);
+
+        assert_eq!(states.len(), 1);
+        assert_eq!(states["pi-live"].0, Some(path));
+        assert_eq!(states["pi-live"].1.phase, PiPhase::Unknown);
     }
 }
