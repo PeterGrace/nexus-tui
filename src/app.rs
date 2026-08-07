@@ -19,6 +19,7 @@ use crate::config::NexusConfig;
 use crate::db::Database;
 use crate::feedback_scanner;
 use crate::git;
+use crate::pi_session;
 use crate::theme;
 use crate::tmux::{sanitize_tmux_name, TmuxManager};
 use crate::types::*;
@@ -125,6 +126,7 @@ pub struct App {
     // Feedback scanner: sessions needing user attention (tmux session names)
     pub(crate) attention_sessions: HashSet<String>,
     feedback_rx: Option<mpsc::Receiver<HashSet<String>>>,
+    feedback_targets_tx: Option<mpsc::Sender<Vec<feedback_scanner::FeedbackTarget>>>,
     pub(crate) attention_effects: HashMap<String, Effect>,
     // Update checker: is a newer version available upstream?
     pub(crate) update_available: bool,
@@ -201,17 +203,17 @@ impl App {
         let cached_counts = count_sessions(&tree);
 
         // Spawn capture worker and feedback scanner if tmux is available
-        let (interactor_state, feedback_rx) = if tmux_available {
+        let (interactor_state, feedback_rx, feedback_targets_tx) = if tmux_available {
             // Configure true color + keybindings (no-op if server not yet started)
             if !tmux_sessions.is_empty() {
                 let _ = tmux.configure_server();
             }
             let (session_tx, content_rx, nudge_tx) = capture_worker::spawn(tmux.clone());
             let is = InteractorState::new(tmux.clone(), content_rx, session_tx, nudge_tx);
-            let frx = feedback_scanner::spawn(tmux.clone());
-            (Some(is), Some(frx))
+            let handle = feedback_scanner::spawn(tmux.clone());
+            (Some(is), Some(handle.attention_rx), Some(handle.targets_tx))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         // Spawn background update checker
@@ -269,6 +271,7 @@ impl App {
             area_logo_border_y: 0,
             attention_sessions: HashSet::new(),
             feedback_rx,
+            feedback_targets_tx,
             attention_effects: HashMap::new(),
             pending_wt_create: None,
             pending_wt_teardown: None,
@@ -279,6 +282,7 @@ impl App {
         // Wire up interactor to the restored session (if any)
         app.refresh_cached_selected();
         app.sync_interactor_to_selection();
+        app.sync_feedback_targets();
 
         app
     }
@@ -2056,11 +2060,18 @@ impl App {
                 self.refresh_cached_selected();
             }
 
+            self.sync_feedback_targets();
             self.dirty = true;
         }
     }
 
     /// Rebuild attention effects with the current theme's hazard color.
+    fn sync_feedback_targets(&self) {
+        if let Some(tx) = &self.feedback_targets_tx {
+            let _ = tx.send(collect_feedback_targets(&self.tree));
+        }
+    }
+
     fn rebuild_attention_effects(&mut self) {
         self.attention_effects.clear();
         for name in &self.attention_sessions {
@@ -2129,11 +2140,47 @@ fn collect_sessions_needing_detection(tree: &[TreeNode]) -> Vec<(String, Session
     result
 }
 
+fn collect_feedback_targets(tree: &[TreeNode]) -> Vec<feedback_scanner::FeedbackTarget> {
+    let mut result = Vec::new();
+    for node in tree {
+        match node {
+            TreeNode::Group(group) => result.extend(collect_feedback_targets(&group.children)),
+            TreeNode::Session(session) if session.status != SessionStatus::Dead => {
+                let Some(tmux_name) = session.tmux_name.clone() else {
+                    continue;
+                };
+                let pi_locator = if session.agent == SessionAgent::Pi {
+                    session
+                        .cwd
+                        .as_deref()
+                        .zip(session.agent_session_id.as_deref())
+                        .map(|(cwd, session_id)| feedback_scanner::PiSessionLocator {
+                            cwd: cwd.to_string_lossy().to_string(),
+                            session_id: session_id.to_string(),
+                        })
+                } else {
+                    None
+                };
+                result.push(feedback_scanner::FeedbackTarget {
+                    tmux_name,
+                    agent: session.agent,
+                    pi_locator,
+                });
+            }
+            TreeNode::Session(_) => {}
+        }
+    }
+    result
+}
+
 fn snapshot_agent_session_ids(agent: SessionAgent, cwd: &str) -> HashSet<String> {
     match agent {
         SessionAgent::Claude => snapshot_jsonl_stems(cwd),
         SessionAgent::Codex => codex_sessions(cwd).into_iter().map(|(id, _)| id).collect(),
-        SessionAgent::Pi => pi_sessions(cwd).into_iter().map(|(id, _)| id).collect(),
+        SessionAgent::Pi => pi_session::sessions(cwd)
+            .into_iter()
+            .map(|session| session.id)
+            .collect(),
         SessionAgent::Unknown => HashSet::new(),
     }
 }
@@ -2201,74 +2248,14 @@ fn detect_codex_session_id(cwd: &str, pre_launch: Option<&HashSet<String>>) -> O
     }
 }
 
-/// Return Pi session IDs for `cwd`, newest first.
-fn pi_sessions(cwd: &str) -> Vec<(String, std::time::SystemTime)> {
-    let root = std::env::var_os("PI_CODING_AGENT_SESSION_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("PI_CODING_AGENT_DIR")
-                .map(PathBuf::from)
-                .or_else(|| dirs::home_dir().map(|home| home.join(".pi/agent")))
-                .map(|agent_dir| agent_dir.join("sessions"))
-        });
-    let Some(root) = root else {
-        return Vec::new();
-    };
-    pi_sessions_in(&root, cwd)
-}
-
-fn pi_sessions_in(root: &std::path::Path, cwd: &str) -> Vec<(String, std::time::SystemTime)> {
-    use std::io::BufRead;
-
-    let mut pending = vec![root.to_path_buf()];
-    let mut sessions = Vec::new();
-    while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-                continue;
-            }
-            if path.extension().is_none_or(|ext| ext != "jsonl") {
-                continue;
-            }
-            let Ok(file) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let Some(Ok(first_line)) = std::io::BufReader::new(file).lines().next() else {
-                continue;
-            };
-            let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) else {
-                continue;
-            };
-            if header["type"].as_str() != Some("session") || header["cwd"].as_str() != Some(cwd) {
-                continue;
-            }
-            let Some(id) = header["id"].as_str() else {
-                continue;
-            };
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
-            sessions.push((id.to_string(), modified));
-        }
-    }
-    sessions.sort_by_key(|session| std::cmp::Reverse(session.1));
-    sessions
-}
-
 fn detect_pi_session_id(cwd: &str, pre_launch: Option<&HashSet<String>>) -> Option<String> {
-    let sessions = pi_sessions(cwd);
+    let sessions = pi_session::sessions(cwd);
     match pre_launch {
         Some(snapshot) => sessions
             .into_iter()
-            .find(|(id, _)| !snapshot.contains(id))
-            .map(|(id, _)| id),
-        None => sessions.into_iter().next().map(|(id, _)| id),
+            .find(|session| !snapshot.contains(&session.id))
+            .map(|session| session.id),
+        None => sessions.into_iter().next().map(|session| session.id),
     }
 }
 
@@ -2585,25 +2572,54 @@ mod tests {
     }
 
     #[test]
-    fn test_pi_sessions_reads_matching_session_headers_recursively() {
-        let temp = tempfile::tempdir().unwrap();
-        let nested = temp.path().join("--tmp-project--");
-        std::fs::create_dir(&nested).unwrap();
-        std::fs::write(
-            nested.join("matching.jsonl"),
-            r#"{"type":"session","version":3,"id":"pi-session-id","cwd":"/tmp/project"}
-{"type":"message"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            nested.join("other.jsonl"),
-            r#"{"type":"session","version":3,"id":"other-id","cwd":"/tmp/other"}"#,
-        )
-        .unwrap();
-        std::fs::write(nested.join("malformed.jsonl"), "not json").unwrap();
+    fn collect_feedback_targets_includes_only_live_named_sessions() {
+        let mut tree = crate::mock::mock_tree();
+        let TreeNode::Group(first_group) = &mut tree[0] else {
+            panic!("first fixture node must be a group");
+        };
+        let TreeNode::Session(first_session) = &mut first_group.children[0] else {
+            panic!("first fixture child must be a session");
+        };
+        first_session.agent = SessionAgent::Codex;
+        first_session.agent_session_id = Some("codex-id".to_string());
 
-        let sessions = pi_sessions_in(temp.path(), "/tmp/project");
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].0, "pi-session-id");
+        let targets = collect_feedback_targets(&tree);
+
+        assert_eq!(targets.len(), 3);
+        let target = targets
+            .iter()
+            .find(|target| target.tmux_name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+            .unwrap();
+        assert_eq!(target.agent, SessionAgent::Codex);
+        assert_eq!(target.pi_locator, None);
+        assert!(targets.iter().all(|target| !target.tmux_name.is_empty()));
+    }
+
+    #[test]
+    fn collect_feedback_targets_passes_pi_locator_metadata_without_resolving_a_path() {
+        let mut tree = crate::mock::mock_tree();
+        let TreeNode::Group(first_group) = &mut tree[0] else {
+            panic!("first fixture node must be a group");
+        };
+        let TreeNode::Session(first_session) = &mut first_group.children[0] else {
+            panic!("first fixture child must be a session");
+        };
+        first_session.agent = SessionAgent::Pi;
+        first_session.cwd = Some(PathBuf::from("/tmp/project"));
+        first_session.agent_session_id = Some("pi-session-id".to_string());
+
+        let targets = collect_feedback_targets(&tree);
+        let target = targets
+            .iter()
+            .find(|target| target.tmux_name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+            .unwrap();
+
+        assert_eq!(
+            target.pi_locator,
+            Some(feedback_scanner::PiSessionLocator {
+                cwd: "/tmp/project".to_string(),
+                session_id: "pi-session-id".to_string(),
+            })
+        );
     }
 }
