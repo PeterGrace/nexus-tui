@@ -2143,19 +2143,22 @@ fn collect_feedback_targets(tree: &[TreeNode]) -> Vec<feedback_scanner::Feedback
                 let Some(tmux_name) = session.tmux_name.clone() else {
                     continue;
                 };
-                let pi_session_path = if session.agent == SessionAgent::Pi {
+                let pi_locator = if session.agent == SessionAgent::Pi {
                     session
                         .cwd
                         .as_deref()
                         .zip(session.agent_session_id.as_deref())
-                        .and_then(|(cwd, id)| pi_session::find_path(&cwd.to_string_lossy(), id))
+                        .map(|(cwd, session_id)| feedback_scanner::PiSessionLocator {
+                            cwd: cwd.to_string_lossy().to_string(),
+                            session_id: session_id.to_string(),
+                        })
                 } else {
                     None
                 };
                 result.push(feedback_scanner::FeedbackTarget {
                     tmux_name,
                     agent: session.agent,
-                    pi_session_path,
+                    pi_locator,
                 });
             }
             TreeNode::Session(_) => {}
@@ -2515,7 +2518,35 @@ mod tests {
             .find(|target| target.tmux_name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
             .unwrap();
         assert_eq!(target.agent, SessionAgent::Codex);
-        assert_eq!(target.pi_session_path, None);
+        assert_eq!(target.pi_locator, None);
         assert!(targets.iter().all(|target| !target.tmux_name.is_empty()));
+    }
+
+    #[test]
+    fn collect_feedback_targets_passes_pi_locator_metadata_without_resolving_a_path() {
+        let mut tree = crate::mock::mock_tree();
+        let TreeNode::Group(first_group) = &mut tree[0] else {
+            panic!("first fixture node must be a group");
+        };
+        let TreeNode::Session(first_session) = &mut first_group.children[0] else {
+            panic!("first fixture child must be a session");
+        };
+        first_session.agent = SessionAgent::Pi;
+        first_session.cwd = Some(PathBuf::from("/tmp/project"));
+        first_session.agent_session_id = Some("pi-session-id".to_string());
+
+        let targets = collect_feedback_targets(&tree);
+        let target = targets
+            .iter()
+            .find(|target| target.tmux_name == "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
+            .unwrap();
+
+        assert_eq!(
+            target.pi_locator,
+            Some(feedback_scanner::PiSessionLocator {
+                cwd: "/tmp/project".to_string(),
+                session_id: "pi-session-id".to_string(),
+            })
+        );
     }
 }

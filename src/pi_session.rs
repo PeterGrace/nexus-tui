@@ -105,8 +105,14 @@ pub(crate) fn latest_assistant_text(path: &Path) -> Result<Option<String>> {
         if value["type"].as_str() != Some("message") {
             continue;
         }
-        let text = if value["role"].as_str() == Some("assistant") {
-            let blocks = value["content"].as_array();
+        // Pi v3 nests role/content under `message`. Keep the flattened shape
+        // as a fallback for installations that still emit it.
+        let message = value
+            .get("message")
+            .filter(|message| message.is_object())
+            .unwrap_or(&value);
+        let text = if message["role"].as_str() == Some("assistant") {
+            let blocks = message["content"].as_array();
             let parts: Vec<&str> = blocks
                 .into_iter()
                 .flatten()
@@ -171,7 +177,35 @@ mod tests {
     }
 
     #[test]
-    fn latest_assistant_text_joins_text_blocks_and_skips_metadata() {
+    fn latest_assistant_text_parses_nested_pi_v3_messages() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        write_session(
+            &path,
+            "pi-id",
+            "/tmp/project",
+            concat!(
+                "{\"type\":\"message\",\"id\":\"msg-1\",\"parentId\":null,",
+                "\"timestamp\":\"2026-08-06T12:00:00.000Z\",\"message\":{",
+                "\"role\":\"assistant\",\"content\":[",
+                "{\"type\":\"thinking\",\"thinking\":\"Checking the plan\"},",
+                "{\"type\":\"text\",\"text\":\"Does this\"},",
+                "{\"type\":\"toolCall\",\"id\":\"call-1\",\"name\":\"read\",\"arguments\":{}},",
+                "{\"type\":\"text\",\"text\":\"look right?\"}],",
+                "\"provider\":\"example\",\"model\":\"example-model\",",
+                "\"timestamp\":1775476800000}}\n",
+                "{\"type\":\"model_change\",\"modelId\":\"example\"}"
+            ),
+        );
+
+        assert_eq!(
+            latest_assistant_text(&path).unwrap().as_deref(),
+            Some("Does this\nlook right?")
+        );
+    }
+
+    #[test]
+    fn latest_assistant_text_retains_flat_message_compatibility() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session.jsonl");
         write_session(
@@ -180,16 +214,13 @@ mod tests {
             "/tmp/project",
             concat!(
                 "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[",
-                "{\"type\":\"text\",\"text\":\"Does this\"},",
-                "{\"type\":\"toolCall\",\"name\":\"read\"},",
-                "{\"type\":\"text\",\"text\":\"look right?\"}]}\n",
-                "{\"type\":\"model_change\",\"modelId\":\"example\"}"
+                "{\"type\":\"text\",\"text\":\"Continue?\"}]}"
             ),
         );
 
         assert_eq!(
             latest_assistant_text(&path).unwrap().as_deref(),
-            Some("Does this\nlook right?")
+            Some("Continue?")
         );
     }
 
@@ -206,7 +237,7 @@ mod tests {
                 "pi-id",
                 "/tmp/project",
                 &format!(
-                    "{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Continue?\"}}]}}\n{{\"type\":\"message\",\"role\":\"{role}\",\"content\":{content}}}"
+                    "{{\"type\":\"message\",\"id\":\"assistant-1\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"Continue?\"}}]}}}}\n{{\"type\":\"message\",\"id\":\"latest-2\",\"message\":{{\"role\":\"{role}\",\"content\":{content}}}}}"
                 ),
             );
             assert_eq!(latest_assistant_text(&path).unwrap(), None);
@@ -221,7 +252,7 @@ mod tests {
             &path,
             "pi-id",
             "/tmp/project",
-            "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[",
+            "{\"type\":\"message\",\"id\":\"partial\",\"message\":{\"role\":\"assistant\",\"content\":[",
         );
 
         assert!(latest_assistant_text(&path).is_err());

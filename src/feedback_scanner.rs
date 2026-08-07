@@ -1,12 +1,12 @@
-//! Background scanner for Claude Code halt-state detection.
+//! Background scanner for agent input-attention detection.
 //!
 //! Polls all live tmux sessions every ~2 seconds using lightweight text-only
-//! capture (`capture_pane_tail`). Pattern-matches the last 20 lines for known
-//! halt signatures (permission prompts, MCP confirmations) and sends the set
-//! of halted session names to the main thread via mpsc channel.
+//! capture (`capture_pane_tail`). It detects Claude halt signatures directly
+//! and combines Pi's `Working...` transition with its latest JSONL message,
+//! then sends the attention set to the main thread via mpsc channel.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use crate::types::SessionAgent;
 const SCAN_INTERVAL: Duration = Duration::from_secs(2);
 const CAPTURE_LINES: u32 = 20;
 
-type PiStates = HashMap<String, (Option<PathBuf>, PiAttentionState)>;
+type PiStates = HashMap<String, PiTargetState>;
 
 /// Known halt patterns — substring matches against each captured line.
 ///
@@ -33,10 +33,16 @@ const HALT_PATTERNS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PiSessionLocator {
+    pub(crate) cwd: String,
+    pub(crate) session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FeedbackTarget {
     pub(crate) tmux_name: String,
     pub(crate) agent: SessionAgent,
-    pub(crate) pi_session_path: Option<PathBuf>,
+    pub(crate) pi_locator: Option<PiSessionLocator>,
 }
 
 pub(crate) struct FeedbackScannerHandle {
@@ -85,6 +91,7 @@ fn scanner_loop(
                     .map(|session| session.session_id.as_str())
                     .collect();
                 let mut halted = begin_scan_cycle(&last_set, Some(&live), &targets, &mut pi_states);
+                resolve_pi_paths(&mut pi_states);
 
                 for session in &sessions {
                     let Ok(text) = tmux.capture_pane_tail(&session.session_id, CAPTURE_LINES)
@@ -96,21 +103,14 @@ fn scanner_loop(
 
                     if let Some(target) = targets.get(&session.session_id) {
                         if target.agent == SessionAgent::Pi {
-                            if let Some((path, state)) = pi_states.get_mut(&session.session_id) {
-                                if state.observe(pi_is_working(&text)) {
-                                    let evaluation = path
-                                        .as_deref()
-                                        .map(pi_session::latest_assistant_text)
-                                        .transpose();
-                                    match evaluation {
-                                        Ok(Some(Some(assistant_text))) => {
-                                            state.resolve(requests_input(&assistant_text));
-                                        }
-                                        Ok(Some(None)) => state.resolve(false),
-                                        Ok(None) | Err(_) => {}
-                                    }
+                            if let Some(pi_state) = pi_states.get_mut(&session.session_id) {
+                                if pi_state.attention.observe(pi_is_working(&text)) {
+                                    evaluate_pi_path(
+                                        pi_state.path.as_deref(),
+                                        &mut pi_state.attention,
+                                    );
                                 }
-                                session_halted |= state.is_attention();
+                                session_halted |= pi_state.attention.is_attention();
                             }
                         }
                     }
@@ -160,16 +160,35 @@ const PI_INPUT_PHRASES: &[&str] = &[
     "select one",
 ];
 
+fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start();
+    let delimiter = trimmed.chars().next()?;
+    if !matches!(delimiter, '`' | '~') {
+        return None;
+    }
+    let length = trimmed.chars().take_while(|ch| *ch == delimiter).count();
+    (length >= 3).then(|| (delimiter, length, &trimmed[length..]))
+}
+
 fn prose_without_fences(text: &str) -> String {
-    let mut inside_fence = false;
+    let mut open_fence: Option<(char, usize)> = None;
     let mut prose = Vec::new();
     for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            inside_fence = !inside_fence;
+        if let Some((delimiter, length, suffix)) = fence_marker(line) {
+            match open_fence {
+                None => open_fence = Some((delimiter, length)),
+                Some((open_delimiter, open_length))
+                    if delimiter == open_delimiter
+                        && length >= open_length
+                        && suffix.trim().is_empty() =>
+                {
+                    open_fence = None;
+                }
+                Some(_) => {}
+            }
             continue;
         }
-        if !inside_fence {
+        if open_fence.is_none() {
             prose.push(line);
         }
     }
@@ -208,6 +227,36 @@ struct PiAttentionState {
     evaluation_pending: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PiTargetState {
+    locator: Option<PiSessionLocator>,
+    path: Option<PathBuf>,
+    attention: PiAttentionState,
+}
+
+impl PiTargetState {
+    fn new(locator: Option<PiSessionLocator>) -> Self {
+        Self {
+            locator,
+            path: None,
+            attention: PiAttentionState::default(),
+        }
+    }
+
+    fn update_locator(&mut self, locator: Option<&PiSessionLocator>) {
+        // Missing metadata can be transient. Only a concrete, changed locator
+        // identifies a different transcript and resets the state machine.
+        let Some(locator) = locator else {
+            return;
+        };
+        if self.locator.as_ref() != Some(locator) {
+            self.locator = Some(locator.clone());
+            self.path = None;
+            self.attention = PiAttentionState::default();
+        }
+    }
+}
+
 fn sync_pi_states(targets: &HashMap<String, FeedbackTarget>, states: &mut PiStates) {
     states.retain(|name, _| {
         targets
@@ -219,15 +268,11 @@ fn sync_pi_states(targets: &HashMap<String, FeedbackTarget>, states: &mut PiStat
         .filter(|target| target.agent == SessionAgent::Pi)
     {
         match states.get_mut(&target.tmux_name) {
-            Some((path, state)) if *path != target.pi_session_path => {
-                *path = target.pi_session_path.clone();
-                *state = PiAttentionState::default();
-            }
-            Some(_) => {}
+            Some(state) => state.update_locator(target.pi_locator.as_ref()),
             None => {
                 states.insert(
                     target.tmux_name.clone(),
-                    (target.pi_session_path.clone(), PiAttentionState::default()),
+                    PiTargetState::new(target.pi_locator.clone()),
                 );
             }
         }
@@ -253,17 +298,60 @@ fn sync_live_pi_states(
             continue;
         }
         match states.get_mut(*name) {
-            Some((path, state)) if *path != target.pi_session_path => {
-                *path = target.pi_session_path.clone();
-                *state = PiAttentionState::default();
-            }
-            Some(_) => {}
+            Some(state) => state.update_locator(target.pi_locator.as_ref()),
             None => {
                 states.insert(
                     target.tmux_name.clone(),
-                    (target.pi_session_path.clone(), PiAttentionState::default()),
+                    PiTargetState::new(target.pi_locator.clone()),
                 );
             }
+        }
+    }
+}
+
+fn apply_pi_path_resolution(state: &mut PiTargetState, resolved: Option<PathBuf>) {
+    // A failed lookup is not evidence that the known transcript disappeared.
+    // Preserve both its cached path and attention state for a later retry.
+    let Some(path) = resolved else {
+        return;
+    };
+    if state.path.as_ref() != Some(&path) {
+        state.path = Some(path);
+        state.attention = PiAttentionState::default();
+    }
+}
+
+fn resolve_pi_paths(states: &mut PiStates) {
+    resolve_pi_paths_with(states, |locator| {
+        pi_session::find_path(&locator.cwd, &locator.session_id)
+    });
+}
+
+fn resolve_pi_paths_with(
+    states: &mut PiStates,
+    mut resolver: impl FnMut(&PiSessionLocator) -> Option<PathBuf>,
+) {
+    for state in states.values_mut() {
+        // Cached paths do not require another recursive discovery scan.
+        if state.path.is_some() {
+            continue;
+        }
+        let Some(locator) = state.locator.clone() else {
+            continue;
+        };
+        apply_pi_path_resolution(state, resolver(&locator));
+    }
+}
+
+fn evaluate_pi_path(path: Option<&Path>, state: &mut PiAttentionState) {
+    let Some(path) = path else {
+        return;
+    };
+    match pi_session::latest_assistant_text(path) {
+        Ok(Some(assistant_text)) => state.resolve(requests_input(&assistant_text)),
+        Ok(None) => state.resolve(false),
+        Err(_) => {
+            // Incomplete, absent, or unreadable JSONL remains pending.
         }
     }
 }
@@ -416,6 +504,32 @@ mod tests {
     }
 
     #[test]
+    fn shorter_backtick_marker_does_not_close_a_four_backtick_fence() {
+        let text = concat!(
+            "Example:\n",
+            "````markdown\n",
+            "```\n",
+            "Does this look right?\n",
+            "````\n",
+            "The example is complete."
+        );
+        assert!(!requests_input(text));
+    }
+
+    #[test]
+    fn tilde_marker_does_not_close_a_backtick_fence() {
+        let text = concat!(
+            "Example:\n",
+            "```text\n",
+            "~~~\n",
+            "Should I continue?\n",
+            "```\n",
+            "The example is complete."
+        );
+        assert!(!requests_input(text));
+    }
+
+    #[test]
     fn unknown_idle_requests_one_recovery_evaluation() {
         let mut state = PiAttentionState::default();
         assert!(state.observe(false));
@@ -451,37 +565,138 @@ mod tests {
         assert!(!state.is_attention());
     }
 
+    fn locator(id: &str) -> PiSessionLocator {
+        PiSessionLocator {
+            cwd: "/tmp/project".to_string(),
+            session_id: id.to_string(),
+        }
+    }
+
+    fn pi_target(name: &str, locator: Option<PiSessionLocator>) -> FeedbackTarget {
+        FeedbackTarget {
+            tmux_name: name.to_string(),
+            agent: SessionAgent::Pi,
+            pi_locator: locator,
+        }
+    }
+
+    fn attention_state(locator: PiSessionLocator, path: PathBuf) -> PiTargetState {
+        PiTargetState {
+            locator: Some(locator),
+            path: Some(path),
+            attention: PiAttentionState {
+                phase: PiPhase::Attention,
+                evaluation_pending: false,
+            },
+        }
+    }
+
     #[test]
-    fn sync_pi_states_removes_missing_targets_and_resets_changed_paths() {
-        let old_path = PathBuf::from("old.jsonl");
-        let new_path = PathBuf::from("new.jsonl");
+    fn sync_pi_states_removes_missing_targets_and_resets_changed_locators() {
         let mut states = HashMap::from([
             (
                 "changed".to_string(),
-                (
-                    Some(old_path),
-                    PiAttentionState {
-                        phase: PiPhase::Attention,
-                        evaluation_pending: false,
-                    },
-                ),
+                attention_state(locator("old-id"), PathBuf::from("old.jsonl")),
             ),
-            ("removed".to_string(), (None, PiAttentionState::default())),
+            (
+                "removed".to_string(),
+                PiTargetState::new(Some(locator("removed-id"))),
+            ),
         ]);
         let targets = HashMap::from([(
             "changed".to_string(),
-            FeedbackTarget {
-                tmux_name: "changed".to_string(),
-                agent: SessionAgent::Pi,
-                pi_session_path: Some(new_path.clone()),
-            },
+            pi_target("changed", Some(locator("new-id"))),
         )]);
 
         sync_pi_states(&targets, &mut states);
 
         assert_eq!(states.len(), 1);
-        assert_eq!(states["changed"].0, Some(new_path));
-        assert_eq!(states["changed"].1.phase, PiPhase::Unknown);
+        assert_eq!(states["changed"].locator, Some(locator("new-id")));
+        assert_eq!(states["changed"].path, None);
+        assert_eq!(states["changed"].attention.phase, PiPhase::Unknown);
+    }
+
+    #[test]
+    fn unresolved_path_observation_preserves_cached_path_and_attention() {
+        let path = PathBuf::from("session.jsonl");
+        let mut state = attention_state(locator("pi-id"), path.clone());
+
+        apply_pi_path_resolution(&mut state, None);
+
+        assert_eq!(state.path, Some(path));
+        assert_eq!(state.attention.phase, PiPhase::Attention);
+    }
+
+    #[test]
+    fn missing_locator_snapshot_preserves_cached_path_and_attention() {
+        let path = PathBuf::from("session.jsonl");
+        let targets = HashMap::from([("pi-live".to_string(), pi_target("pi-live", None))]);
+        let mut states = HashMap::from([(
+            "pi-live".to_string(),
+            attention_state(locator("pi-id"), path.clone()),
+        )]);
+
+        sync_pi_states(&targets, &mut states);
+
+        assert_eq!(states["pi-live"].locator, Some(locator("pi-id")));
+        assert_eq!(states["pi-live"].path, Some(path));
+        assert_eq!(states["pi-live"].attention.phase, PiPhase::Attention);
+    }
+
+    #[test]
+    fn path_resolution_retries_unresolved_and_skips_cached_paths() {
+        let mut states = HashMap::from([
+            (
+                "known".to_string(),
+                attention_state(locator("known-id"), PathBuf::from("known.jsonl")),
+            ),
+            (
+                "unresolved".to_string(),
+                PiTargetState::new(Some(locator("unresolved-id"))),
+            ),
+        ]);
+        let mut lookups = Vec::new();
+
+        resolve_pi_paths_with(&mut states, |locator| {
+            lookups.push(locator.session_id.clone());
+            None
+        });
+        resolve_pi_paths_with(&mut states, |locator| {
+            lookups.push(locator.session_id.clone());
+            Some(PathBuf::from("resolved.jsonl"))
+        });
+
+        assert_eq!(lookups, ["unresolved-id", "unresolved-id"]);
+        assert_eq!(
+            states["unresolved"].path,
+            Some(PathBuf::from("resolved.jsonl"))
+        );
+        assert_eq!(states["known"].attention.phase, PiPhase::Attention);
+    }
+
+    #[test]
+    fn idle_nested_pi_v3_assistant_question_enters_attention() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"version\":3,\"id\":\"pi-id\",\"cwd\":\"/tmp/project\"}\n",
+                "{\"type\":\"message\",\"id\":\"msg-1\",\"parentId\":null,",
+                "\"timestamp\":\"2026-08-06T12:00:00.000Z\",\"message\":{",
+                "\"role\":\"assistant\",\"content\":[",
+                "{\"type\":\"text\",\"text\":\"The change is ready. Proceed?\"}],",
+                "\"provider\":\"example\",\"model\":\"example-model\",",
+                "\"timestamp\":1775476800000}}\n"
+            ),
+        )
+        .unwrap();
+        let mut state = PiAttentionState::default();
+
+        assert!(state.observe(false));
+        evaluate_pi_path(Some(&path), &mut state);
+
+        assert!(state.is_attention());
     }
 
     #[test]
@@ -489,28 +704,18 @@ mod tests {
         let path = PathBuf::from("session.jsonl");
         let targets = HashMap::from([(
             "pi-live".to_string(),
-            FeedbackTarget {
-                tmux_name: "pi-live".to_string(),
-                agent: SessionAgent::Pi,
-                pi_session_path: Some(path.clone()),
-            },
+            pi_target("pi-live", Some(locator("pi-id"))),
         )]);
         let last_set = HashSet::from(["pi-live".to_string()]);
         let mut states = HashMap::from([(
             "pi-live".to_string(),
-            (
-                Some(path),
-                PiAttentionState {
-                    phase: PiPhase::Attention,
-                    evaluation_pending: false,
-                },
-            ),
+            attention_state(locator("pi-id"), path),
         )]);
 
         let halted = begin_scan_cycle(&last_set, None, &targets, &mut states);
 
         assert_eq!(halted, last_set);
-        assert_eq!(states["pi-live"].1.phase, PiPhase::Attention);
+        assert_eq!(states["pi-live"].attention.phase, PiPhase::Attention);
     }
 
     #[test]
@@ -518,23 +723,13 @@ mod tests {
         let path = PathBuf::from("session.jsonl");
         let targets = HashMap::from([(
             "pi-live".to_string(),
-            FeedbackTarget {
-                tmux_name: "pi-live".to_string(),
-                agent: SessionAgent::Pi,
-                pi_session_path: Some(path.clone()),
-            },
+            pi_target("pi-live", Some(locator("pi-id"))),
         )]);
         let live = HashSet::from(["pi-live"]);
         let last_set = HashSet::from(["pi-live".to_string()]);
         let mut states = HashMap::from([(
             "pi-live".to_string(),
-            (
-                Some(path),
-                PiAttentionState {
-                    phase: PiPhase::Attention,
-                    evaluation_pending: false,
-                },
-            ),
+            attention_state(locator("pi-id"), path),
         )]);
 
         let halted = begin_scan_cycle(&last_set, Some(&live), &targets, &mut states);
@@ -544,14 +739,9 @@ mod tests {
 
     #[test]
     fn sync_live_pi_states_recreates_still_targeted_live_sessions() {
-        let path = PathBuf::from("session.jsonl");
         let targets = HashMap::from([(
             "pi-live".to_string(),
-            FeedbackTarget {
-                tmux_name: "pi-live".to_string(),
-                agent: SessionAgent::Pi,
-                pi_session_path: Some(path.clone()),
-            },
+            pi_target("pi-live", Some(locator("pi-id"))),
         )]);
         let live = HashSet::from(["pi-live"]);
         let mut states = PiStates::new();
@@ -559,7 +749,8 @@ mod tests {
         sync_live_pi_states(&live, &targets, &mut states);
 
         assert_eq!(states.len(), 1);
-        assert_eq!(states["pi-live"].0, Some(path));
-        assert_eq!(states["pi-live"].1.phase, PiPhase::Unknown);
+        assert_eq!(states["pi-live"].locator, Some(locator("pi-id")));
+        assert_eq!(states["pi-live"].path, None);
+        assert_eq!(states["pi-live"].attention.phase, PiPhase::Unknown);
     }
 }
