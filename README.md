@@ -23,7 +23,7 @@ Nexus gives you a persistent, organized workspace for managing multiple coding-a
 - **Editor integration** — open your editor in any session's working directory with `Alt+v`
 - **Text selection** — click+drag in the session panel to select and copy text (via OSC 52)
 - **Fullscreen session** — `Alt+z` attaches to the session's tmux pane full-screen (no TUI chrome) for clean native-terminal copy/paste; press `Alt+z` again (or `Ctrl+Q`) to return
-- **Feedback detection** — automatically detects when Claude is waiting for permission or confirmation across all sessions, pulsing the session tree row with a glow effect (no setup required)
+- **Feedback detection** — pulses a session row when Claude is waiting for permission or confirmation, or when Pi heuristically appears to be asking for user input (Pi detection is intentionally broad and may occasionally produce false positives)
 
 ## Install
 
