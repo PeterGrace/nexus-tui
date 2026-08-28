@@ -635,8 +635,11 @@ fn fetch_base(repo_root: &Path, remote: &str, branch: &str) -> Result<String> {
             remote,
             branch,
         ])
-        // Never let a credential prompt block the caller: this runs on the
-        // TUI's worktree-creation thread with no terminal to prompt on.
+        // Block *terminal* credential prompts: this runs on the TUI's
+        // worktree-creation thread, which has no terminal to prompt on. A
+        // configured credential helper can still authenticate non-interactively,
+        // which is what makes private remotes work; FETCH_TIMEOUT bounds the
+        // wait if a helper of its own decides to go interactive.
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1368,6 +1371,27 @@ mod tests {
         assert_eq!(base.rev.as_deref(), Some(at_clone_time.as_str()));
         assert_ne!(base.rev.as_deref(), Some(latest.as_str()));
         assert!(base.warning.is_none());
+    }
+
+    #[test]
+    fn test_resolve_base_auto_no_fetch_without_recorded_remote_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_test_repo(&repo);
+        commit_file(&repo, "a.txt", "one");
+        // `git remote add` records no refs/remotes/origin/HEAD, unlike a clone.
+        git(&repo, &["remote", "add", "origin", "/nonexistent/repo.git"]);
+
+        let settings = BaseSettings {
+            spec: DEFAULT_BASE_SPEC.to_string(),
+            fetch: false,
+        };
+        let base = resolve_base(&repo, &settings);
+        assert_eq!(base.rev, None);
+        assert_eq!(base.display, "HEAD");
+        let warning = base.warning.expect("expected a warning");
+        assert!(warning.contains("origin/HEAD"), "got: {warning}");
     }
 
     #[test]

@@ -202,7 +202,7 @@ fetch = false             # skip the network; use local refs only
 | `<remote>/<branch>` | That remote branch, fetched first unless `fetch = false`. |
 | anything else | Treated as a local revision — a branch, tag, or commit SHA. |
 
-If the fetch fails (offline, VPN down, credentials needed), worktree creation still succeeds: Nexus falls back to the local remote-tracking ref, or to `HEAD` if there isn't one, and reports what it used in the status bar. Fetches never prompt for credentials and time out after 30 seconds.
+If the fetch fails (offline, VPN down, credentials needed), worktree creation still succeeds: Nexus falls back to the local remote-tracking ref, or to `HEAD` if there isn't one, and reports what it used in the status bar. Fetches run with `GIT_TERMINAL_PROMPT=0` and no stdin, so they never block on a terminal credential prompt, and they time out after 30 seconds. Your existing credential helper still works normally, which is how private remotes stay fetchable.
 
 ### Worktree Hooks
 
