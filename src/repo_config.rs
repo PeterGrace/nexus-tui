@@ -12,6 +12,12 @@ pub struct RepoConfig {
 pub struct RepoWorktreeConfig {
     #[serde(default)]
     pub branch_prefix: Option<String>,
+    /// Where new worktree branches start: `auto`, `HEAD`, or a git revision.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Fetch a remote base before branching from it. Defaults to true.
+    #[serde(default)]
+    pub fetch: Option<bool>,
     #[serde(default)]
     pub on_create: Option<String>,
     #[serde(default)]
@@ -105,5 +111,27 @@ mod tests {
         std::fs::write(tmp.path().join(".nexus.toml"), "").unwrap();
         let cfg = load_repo_config(tmp.path());
         assert!(cfg.worktree.branch_prefix.is_none());
+    }
+
+    #[test]
+    fn test_load_base_and_fetch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".nexus.toml"),
+            "[worktree]\nbase = \"upstream/main\"\nfetch = false\n",
+        )
+        .unwrap();
+        let cfg = load_repo_config(tmp.path());
+        assert_eq!(cfg.worktree.base, Some("upstream/main".to_string()));
+        assert_eq!(cfg.worktree.fetch, Some(false));
+    }
+
+    #[test]
+    fn test_base_and_fetch_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(".nexus.toml"), "[worktree]\n").unwrap();
+        let cfg = load_repo_config(tmp.path());
+        assert!(cfg.worktree.base.is_none());
+        assert!(cfg.worktree.fetch.is_none());
     }
 }

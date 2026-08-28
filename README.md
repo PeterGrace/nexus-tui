@@ -174,6 +174,36 @@ branch_prefix = "custom"  # this repo: custom/fix-bug
 # branch_prefix = ""      # or disable prefix entirely: fix-bug
 ```
 
+**Branch base:** By default, new worktree branches start from your remote's default branch (`origin/main` for most repos), fetched immediately beforehand. This keeps a new session from inheriting whatever the primary checkout happened to have checked out — a stale `main`, an unrelated feature branch, or a detached HEAD.
+
+Nexus never modifies your primary checkout. It fetches (a read-only operation that touches only remote-tracking refs) and passes the resulting commit to `git worktree add` as the start point. It never runs `git pull`, `checkout`, or `merge` in your working tree, so a dirty or mid-rebase primary checkout is fine.
+
+```toml
+# ~/.config/nexus/config.toml (global)
+[worktree]
+base = "auto"     # default: the remote's default branch
+fetch = true      # default: fetch the base before branching
+```
+
+```toml
+# .nexus.toml (per-repo, overrides global)
+[worktree]
+base = "origin/develop"   # a specific remote branch
+# base = "upstream/main"  # useful in forks
+# base = "release/2.x"    # any local branch, tag, or commit
+# base = "HEAD"           # branch from the primary checkout, as Nexus did before
+fetch = false             # skip the network; use local refs only
+```
+
+| `base` value | Start point |
+|---|---|
+| `auto` (default) | The default branch of `origin`, or of the first remote if there is no `origin`. Falls back to `HEAD` when the repo has no remotes. |
+| `HEAD` | Whatever the primary checkout has checked out. |
+| `<remote>/<branch>` | That remote branch, fetched first unless `fetch = false`. |
+| anything else | Treated as a local revision — a branch, tag, or commit SHA. |
+
+If the fetch fails (offline, VPN down, credentials needed), worktree creation still succeeds: Nexus falls back to the local remote-tracking ref, or to `HEAD` if there isn't one, and reports what it used in the status bar. Fetches run with `GIT_TERMINAL_PROMPT=0` and no stdin, so they never block on a terminal credential prompt, and they time out after 30 seconds. Your existing credential helper still works normally, which is how private remotes stay fetchable.
+
 ### Worktree Hooks
 
 Nexus can run custom scripts when creating or tearing down worktrees. If a hook is configured, Nexus delegates the entire operation to it instead of running `git worktree add`/`remove`.
@@ -208,6 +238,7 @@ on_teardown = "scripts/wt-teardown.sh"
 | `NEXUS_BRANCH` | Git branch name |
 | `NEXUS_SESSION_NAME` | Nexus session name (empty on teardown) |
 | `NEXUS_REPO_ROOT` | Repository root path |
+| `NEXUS_BASE_REF` | Resolved base commit for the new branch (empty when branching from `HEAD`) |
 
 **Constraints:**
 
@@ -223,7 +254,7 @@ on_teardown = "scripts/wt-teardown.sh"
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-git -C "$NEXUS_REPO_ROOT" worktree add "$NEXUS_WORKTREE_PATH" -b "$NEXUS_BRANCH"
+git -C "$NEXUS_REPO_ROOT" worktree add "$NEXUS_WORKTREE_PATH" -b "$NEXUS_BRANCH" ${NEXUS_BASE_REF:+"$NEXUS_BASE_REF"}
 cp "$NEXUS_REPO_ROOT/.env.example" "$NEXUS_WORKTREE_PATH/.env" 2>/dev/null || true
 ```
 
