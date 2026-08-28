@@ -9,6 +9,10 @@ use wait_timeout::ChildExt;
 use crate::repo_config;
 
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default base spec: branch from the remote's default branch.
+pub const DEFAULT_BASE_SPEC: &str = "auto";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -16,6 +20,38 @@ const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct RepoInfo {
     pub root: PathBuf,
+}
+
+/// Resolved configuration controlling where a new worktree branch starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseSettings {
+    /// Base spec: `auto`, `HEAD`, or any git revision (`origin/main`, `develop`).
+    pub spec: String,
+    /// Whether to fetch a remote base before branching from it.
+    pub fetch: bool,
+}
+
+/// A concrete start point for a new worktree branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBase {
+    /// Commit passed to `git worktree add`. `None` branches from the primary
+    /// checkout's HEAD, which is git's own default.
+    pub rev: Option<String>,
+    /// Human-readable name of what we based on, for status messages.
+    pub display: String,
+    /// Non-fatal problem hit while resolving (offline, unknown ref, ...).
+    pub warning: Option<String>,
+}
+
+impl ResolvedBase {
+    /// Fall back to the primary checkout's HEAD, carrying an optional reason.
+    fn head(warning: Option<String>) -> Self {
+        Self {
+            rev: None,
+            display: "HEAD".to_string(),
+            warning,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +156,99 @@ pub fn resolve_branch_prefix(repo_root: &Path, global_prefix: Option<&str>) -> S
         .and_then(|n| n.to_str())
         .unwrap_or("session");
     normalize_prefix(dir_name)
+}
+
+/// Resolve where new worktree branches should start from.
+/// Priority per field: per-repo `.nexus.toml` > global config > default.
+pub fn resolve_base_settings(
+    repo_root: &Path,
+    global_base: Option<&str>,
+    global_fetch: Option<bool>,
+) -> BaseSettings {
+    let repo_cfg = repo_config::load_repo_config(repo_root);
+
+    let spec = repo_cfg
+        .worktree
+        .base
+        .as_deref()
+        .or(global_base)
+        .map(normalize_base_spec)
+        .unwrap_or_else(|| DEFAULT_BASE_SPEC.to_string());
+
+    let fetch = repo_cfg.worktree.fetch.or(global_fetch).unwrap_or(true);
+
+    BaseSettings { spec, fetch }
+}
+
+/// Resolve `settings` into a concrete commit to branch from.
+///
+/// Never fails: any problem (offline, auth, unknown ref) degrades to branching
+/// from the primary checkout's HEAD with a warning attached, so creating a
+/// worktree still succeeds when the network does not cooperate.
+pub fn resolve_base(repo_root: &Path, settings: &BaseSettings) -> ResolvedBase {
+    let spec = settings.spec.as_str();
+
+    // Explicit opt-out: branch from whatever the primary checkout has checked
+    // out, which is what Nexus did before this was configurable.
+    if spec.eq_ignore_ascii_case("head") {
+        return ResolvedBase::head(None);
+    }
+
+    let remotes = list_remotes(repo_root);
+    let target = if spec == DEFAULT_BASE_SPEC {
+        default_remote_branch(repo_root, &remotes)
+    } else {
+        split_remote_spec(spec, &remotes)
+    };
+
+    let Some((remote, branch)) = target else {
+        // Not a remote ref — treat the spec as a local revision.
+        if spec == DEFAULT_BASE_SPEC {
+            // No remotes configured at all; HEAD is the only sane base.
+            return ResolvedBase::head(None);
+        }
+        return match verify_rev(repo_root, spec) {
+            Some(rev) => ResolvedBase {
+                rev: Some(rev),
+                display: spec.to_string(),
+                warning: None,
+            },
+            None => {
+                ResolvedBase::head(Some(format!("base '{spec}' not found; branched from HEAD")))
+            }
+        };
+    };
+
+    let display = format!("{remote}/{branch}");
+
+    if !settings.fetch {
+        return local_base(repo_root, &remote, &branch, &display, None);
+    }
+
+    match fetch_base(repo_root, &remote, &branch) {
+        Ok(rev) => ResolvedBase {
+            rev: Some(rev),
+            display,
+            warning: None,
+        },
+        Err(e) => local_base(
+            repo_root,
+            &remote,
+            &branch,
+            &display,
+            Some(shorten(&e.to_string())),
+        ),
+    }
+}
+
+/// Empty or whitespace-only base specs fall back to the default.
+fn normalize_base_spec(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        DEFAULT_BASE_SPEC.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Normalize a prefix string: replace dots/underscores with dashes, then sanitize.
@@ -282,12 +411,15 @@ fn validate_hook_file(path: &Path) -> bool {
 
 /// Create a worktree.
 /// If `create_hook` is provided, delegates to that hook script.
-/// Otherwise runs `git worktree add <path> -b <branch>`.
+/// Otherwise runs `git worktree add <path> -b <branch> [<base>]`.
+/// `base` is the resolved start point; `None` branches from the primary
+/// checkout's HEAD.
 pub fn create_worktree(
     repo_root: &Path,
     session_name: &str,
     worktree_path: &Path,
     branch: &str,
+    base: Option<&str>,
     create_hook: Option<&Path>,
 ) -> Result<()> {
     // Ensure parent directory exists
@@ -296,7 +428,7 @@ pub fn create_worktree(
             .wrap_err_with(|| format!("cannot create worktree parent dir {}", parent.display()))?;
     }
 
-    let env_vars = hook_env_vars(repo_root, worktree_path, branch, session_name);
+    let env_vars = hook_env_vars(repo_root, worktree_path, branch, session_name, base);
 
     if let Some(hook) = create_hook {
         execute_hook(hook, &env_vars)?;
@@ -310,16 +442,23 @@ pub fn create_worktree(
             );
         }
     } else {
+        let mut args = vec![
+            "-C".to_string(),
+            repo_root.to_string_lossy().to_string(),
+            "worktree".to_string(),
+            "add".to_string(),
+            worktree_path.to_string_lossy().to_string(),
+            "-b".to_string(),
+            branch.to_string(),
+        ];
+        // Omitting the start point makes git branch from the primary
+        // checkout's HEAD, which is the documented `base = "HEAD"` behavior.
+        if let Some(base) = base {
+            args.push(base.to_string());
+        }
+
         let output = Command::new("git")
-            .args([
-                "-C",
-                &repo_root.to_string_lossy(),
-                "worktree",
-                "add",
-                &worktree_path.to_string_lossy(),
-                "-b",
-                branch,
-            ])
+            .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .output()
@@ -347,7 +486,7 @@ pub fn remove_worktree(
         return Ok(());
     }
 
-    let env_vars = hook_env_vars(repo_root, worktree_path, branch, "");
+    let env_vars = hook_env_vars(repo_root, worktree_path, branch, "", None);
 
     if let Some(hook) = teardown_hook {
         execute_hook(hook, &env_vars)?;
@@ -480,11 +619,222 @@ fn execute_hook(script: &Path, env: &[(String, String)]) -> Result<()> {
     }
 }
 
+/// Fetch one branch from a remote and return the fetched commit.
+///
+/// Reads the commit back from `FETCH_HEAD` rather than `refs/remotes/<remote>/*`:
+/// a repo with a custom `remote.<name>.fetch` refspec may not maintain those
+/// remote-tracking refs at all, so they can be stale or missing entirely.
+fn fetch_base(repo_root: &Path, remote: &str, branch: &str) -> Result<String> {
+    let mut child = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            remote,
+            branch,
+        ])
+        // Never let a credential prompt block the caller: this runs on the
+        // TUI's worktree-creation thread with no terminal to prompt on.
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .wrap_err("failed to run git fetch")?;
+
+    match child
+        .wait_timeout(FETCH_TIMEOUT)
+        .wrap_err("git fetch wait error")?
+    {
+        Some(status) if status.success() => {}
+        Some(_) => {
+            let stderr = read_stderr(&mut child);
+            if stderr.is_empty() {
+                bail!("git fetch failed");
+            }
+            bail!("{}", stderr);
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("timed out after {}s", FETCH_TIMEOUT.as_secs());
+        }
+    }
+
+    match verify_rev(repo_root, "FETCH_HEAD") {
+        Some(rev) => Ok(rev),
+        None => bail!("FETCH_HEAD did not resolve to a commit"),
+    }
+}
+
+/// Resolve a remote branch from local refs only, with no network access.
+/// `fetch_err` is `Some` when a fetch was attempted and failed.
+fn local_base(
+    repo_root: &Path,
+    remote: &str,
+    branch: &str,
+    display: &str,
+    fetch_err: Option<String>,
+) -> ResolvedBase {
+    let candidates = if branch == "HEAD" {
+        vec![format!("refs/remotes/{remote}/HEAD")]
+    } else {
+        vec![
+            format!("refs/remotes/{remote}/{branch}"),
+            format!("refs/heads/{branch}"),
+        ]
+    };
+
+    let found = candidates.iter().find_map(|c| verify_rev(repo_root, c));
+
+    match (found, fetch_err) {
+        (Some(rev), None) => ResolvedBase {
+            rev: Some(rev),
+            display: display.to_string(),
+            warning: None,
+        },
+        (Some(rev), Some(err)) => ResolvedBase {
+            rev: Some(rev),
+            display: display.to_string(),
+            warning: Some(format!("fetch failed ({err}); used local {display}")),
+        },
+        (None, None) => ResolvedBase::head(Some(format!(
+            "{display} not found locally; branched from HEAD"
+        ))),
+        (None, Some(err)) => {
+            ResolvedBase::head(Some(format!("fetch failed ({err}); branched from HEAD")))
+        }
+    }
+}
+
+/// Resolve a revision to a commit SHA. `None` if it does not exist.
+fn verify_rev(repo_root: &Path, rev: &str) -> Option<String> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+    let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
+}
+
+/// List configured remote names.
+fn list_remotes(repo_root: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .args(["-C", &repo_root.to_string_lossy(), "remote"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Pick the remote and branch that `auto` tracks: the default branch of
+/// `origin`, or of the first remote when there is no `origin`.
+fn default_remote_branch(repo_root: &Path, remotes: &[String]) -> Option<(String, String)> {
+    let remote = remotes
+        .iter()
+        .find(|r| *r == "origin")
+        .or_else(|| remotes.first())?
+        .clone();
+
+    // `refs/remotes/<remote>/HEAD` names the remote's default branch. The SHA
+    // it points at may be stale, but the *name* is all we need — the fetch
+    // that follows is authoritative. Falling back to the literal `HEAD`
+    // refspec asks the remote for its own default branch directly.
+    let branch = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "symbolic-ref",
+            "--short",
+            &format!("refs/remotes/{remote}/HEAD"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .and_then(|s| s.strip_prefix(&format!("{remote}/")).map(str::to_string))
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    Some((remote, branch))
+}
+
+/// Split `origin/main` into `("origin", "main")` when the left side names a
+/// configured remote. Returns `None` for local revisions like `develop`.
+fn split_remote_spec(spec: &str, remotes: &[String]) -> Option<(String, String)> {
+    let (remote, branch) = spec.split_once('/')?;
+    if branch.is_empty() || !remotes.iter().any(|r| r == remote) {
+        return None;
+    }
+    Some((remote.to_string(), branch.to_string()))
+}
+
+/// Drain a child's stderr into a trimmed string.
+fn read_stderr(child: &mut std::process::Child) -> String {
+    child
+        .stderr
+        .take()
+        .map(|mut s| {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut s, &mut buf).ok();
+            buf
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Collapse multi-line git stderr into one short line fit for a status bar.
+fn shorten(msg: &str) -> String {
+    let line = msg
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if line.chars().count() > 80 {
+        format!("{}…", line.chars().take(79).collect::<String>())
+    } else {
+        line.to_string()
+    }
+}
+
 fn hook_env_vars(
     repo_root: &Path,
     worktree_path: &Path,
     branch: &str,
     session_name: &str,
+    base: Option<&str>,
 ) -> Vec<(String, String)> {
     vec![
         (
@@ -496,6 +846,12 @@ fn hook_env_vars(
         (
             "NEXUS_REPO_ROOT".to_string(),
             repo_root.to_string_lossy().to_string(),
+        ),
+        // Empty when the base resolved to the primary checkout's HEAD, so a
+        // hook can test `-n "$NEXUS_BASE_REF"` before using it.
+        (
+            "NEXUS_BASE_REF".to_string(),
+            base.unwrap_or_default().to_string(),
         ),
     ]
 }
@@ -753,6 +1109,350 @@ mod tests {
             .unwrap();
     }
 
+    // --- base resolution helpers ---
+
+    /// Run a git command in `path`, asserting success.
+    fn git(path: &Path, args: &[&str]) -> String {
+        let mut full = vec!["-C", path.to_str().unwrap()];
+        full.extend_from_slice(args);
+        let out = Command::new("git")
+            .args(&full)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn commit_file(path: &Path, name: &str, content: &str) -> String {
+        std::fs::write(path.join(name), content).unwrap();
+        git(path, &["add", name]);
+        git(path, &["commit", "-m", &format!("add {name}")]);
+        git(path, &["rev-parse", "HEAD"])
+    }
+
+    fn head_sha(path: &Path) -> String {
+        git(path, &["rev-parse", "HEAD"])
+    }
+
+    fn current_branch(path: &Path) -> String {
+        git(path, &["branch", "--show-current"])
+    }
+
+    /// Build an "origin" repo plus a clone of it, both with git identity set.
+    fn init_origin_and_clone(tmp: &Path) -> (PathBuf, PathBuf) {
+        let origin = tmp.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        init_test_repo(&origin);
+        commit_file(&origin, "a.txt", "one");
+
+        let clone = tmp.join("clone");
+        Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                origin.to_str().unwrap(),
+                clone.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        git(&clone, &["config", "user.name", "test"]);
+        git(&clone, &["config", "user.email", "test@test.com"]);
+
+        (origin, clone)
+    }
+
+    fn auto() -> BaseSettings {
+        BaseSettings {
+            spec: DEFAULT_BASE_SPEC.to_string(),
+            fetch: true,
+        }
+    }
+
+    #[test]
+    fn test_split_remote_spec() {
+        let remotes = vec!["origin".to_string(), "upstream".to_string()];
+        assert_eq!(
+            split_remote_spec("origin/main", &remotes),
+            Some(("origin".to_string(), "main".to_string()))
+        );
+        assert_eq!(
+            split_remote_spec("upstream/release/2.x", &remotes),
+            Some(("upstream".to_string(), "release/2.x".to_string()))
+        );
+        // Left side is not a configured remote -> local revision
+        assert_eq!(split_remote_spec("feature/foo", &remotes), None);
+        // No slash at all -> local revision
+        assert_eq!(split_remote_spec("develop", &remotes), None);
+        // Trailing slash is not a branch
+        assert_eq!(split_remote_spec("origin/", &remotes), None);
+    }
+
+    #[test]
+    fn test_shorten_collapses_multiline() {
+        assert_eq!(
+            shorten("fatal: could not read\nsecond line"),
+            "fatal: could not read"
+        );
+        assert_eq!(shorten("\n\n  real message  \n"), "real message");
+        let long = "x".repeat(200);
+        let short = shorten(&long);
+        assert_eq!(short.chars().count(), 80);
+        assert!(short.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn test_resolve_base_settings_defaults() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = resolve_base_settings(tmp.path(), None, None);
+        assert_eq!(settings.spec, DEFAULT_BASE_SPEC);
+        assert!(settings.fetch);
+    }
+
+    #[test]
+    fn test_resolve_base_settings_global_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = resolve_base_settings(tmp.path(), Some("origin/develop"), Some(false));
+        assert_eq!(settings.spec, "origin/develop");
+        assert!(!settings.fetch);
+    }
+
+    #[test]
+    fn test_resolve_base_settings_repo_overrides_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".nexus.toml"),
+            "[worktree]\nbase = \"upstream/main\"\nfetch = false\n",
+        )
+        .unwrap();
+        let settings = resolve_base_settings(tmp.path(), Some("origin/develop"), Some(true));
+        assert_eq!(settings.spec, "upstream/main");
+        assert!(!settings.fetch);
+    }
+
+    #[test]
+    fn test_resolve_base_settings_empty_spec_falls_back_to_auto() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = resolve_base_settings(tmp.path(), Some("   "), None);
+        assert_eq!(settings.spec, DEFAULT_BASE_SPEC);
+    }
+
+    #[test]
+    fn test_resolve_base_head_spec_branches_from_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_origin, clone) = init_origin_and_clone(tmp.path());
+        let settings = BaseSettings {
+            spec: "HEAD".to_string(),
+            fetch: true,
+        };
+        let base = resolve_base(&clone, &settings);
+        assert_eq!(base.rev, None);
+        assert_eq!(base.display, "HEAD");
+        assert!(base.warning.is_none());
+    }
+
+    #[test]
+    fn test_resolve_base_auto_without_remotes_is_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_test_repo(tmp.path());
+        let base = resolve_base(tmp.path(), &auto());
+        assert_eq!(base.rev, None);
+        assert!(base.warning.is_none());
+    }
+
+    #[test]
+    fn test_resolve_base_local_revision() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_test_repo(tmp.path());
+        let first = commit_file(tmp.path(), "a.txt", "one");
+        git(tmp.path(), &["branch", "develop"]);
+        commit_file(tmp.path(), "b.txt", "two");
+
+        let settings = BaseSettings {
+            spec: "develop".to_string(),
+            fetch: true,
+        };
+        let base = resolve_base(tmp.path(), &settings);
+        assert_eq!(base.rev.as_deref(), Some(first.as_str()));
+        assert_eq!(base.display, "develop");
+        assert!(base.warning.is_none());
+    }
+
+    #[test]
+    fn test_resolve_base_unknown_revision_warns_and_uses_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        init_test_repo(tmp.path());
+        commit_file(tmp.path(), "a.txt", "one");
+
+        let settings = BaseSettings {
+            spec: "no-such-branch".to_string(),
+            fetch: true,
+        };
+        let base = resolve_base(tmp.path(), &settings);
+        assert_eq!(base.rev, None);
+        assert_eq!(base.display, "HEAD");
+        let warning = base.warning.expect("expected a warning");
+        assert!(warning.contains("no-such-branch"), "got: {warning}");
+    }
+
+    #[test]
+    fn test_resolve_base_auto_fetches_new_remote_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, clone) = init_origin_and_clone(tmp.path());
+
+        // Origin moves ahead after the clone; the clone has not fetched.
+        let latest = commit_file(&origin, "b.txt", "two");
+        assert_ne!(head_sha(&clone), latest);
+
+        let base = resolve_base(&clone, &auto());
+        assert_eq!(
+            base.rev.as_deref(),
+            Some(latest.as_str()),
+            "auto should fetch and use the remote's tip, not the local HEAD"
+        );
+        assert!(
+            base.warning.is_none(),
+            "unexpected warning: {:?}",
+            base.warning
+        );
+        assert_eq!(base.display, format!("origin/{}", current_branch(&origin)));
+    }
+
+    #[test]
+    fn test_resolve_base_ignores_stale_tracking_ref_under_custom_refspec() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, clone) = init_origin_and_clone(tmp.path());
+
+        // Point the fetch refspec somewhere other than refs/remotes/origin/*,
+        // which leaves refs/remotes/origin/<branch> frozen at clone time.
+        git(
+            &clone,
+            &[
+                "config",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/fork/*",
+            ],
+        );
+        let stale = head_sha(&clone);
+        let latest = commit_file(&origin, "b.txt", "two");
+
+        let base = resolve_base(&clone, &auto());
+        assert_eq!(
+            base.rev.as_deref(),
+            Some(latest.as_str()),
+            "should read FETCH_HEAD, not the stale remote-tracking ref"
+        );
+        assert_ne!(base.rev.as_deref(), Some(stale.as_str()));
+    }
+
+    #[test]
+    fn test_resolve_base_without_fetch_uses_stale_tracking_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (origin, clone) = init_origin_and_clone(tmp.path());
+        let at_clone_time = head_sha(&clone);
+        let latest = commit_file(&origin, "b.txt", "two");
+
+        let settings = BaseSettings {
+            spec: format!("origin/{}", current_branch(&origin)),
+            fetch: false,
+        };
+        let base = resolve_base(&clone, &settings);
+        assert_eq!(base.rev.as_deref(), Some(at_clone_time.as_str()));
+        assert_ne!(base.rev.as_deref(), Some(latest.as_str()));
+        assert!(base.warning.is_none());
+    }
+
+    #[test]
+    fn test_resolve_base_offline_remote_falls_back_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_origin, clone) = init_origin_and_clone(tmp.path());
+        let at_clone_time = head_sha(&clone);
+
+        // Repoint origin at a path that does not exist to simulate being offline.
+        git(
+            &clone,
+            &["remote", "set-url", "origin", "/nonexistent/repo.git"],
+        );
+
+        let base = resolve_base(&clone, &auto());
+        assert_eq!(
+            base.rev.as_deref(),
+            Some(at_clone_time.as_str()),
+            "should degrade to the local remote-tracking ref"
+        );
+        let warning = base.warning.expect("expected a fetch warning");
+        assert!(warning.contains("fetch failed"), "got: {warning}");
+    }
+
+    #[test]
+    fn test_create_worktree_uses_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_test_repo(&repo);
+        let first = commit_file(&repo, "a.txt", "one");
+        let second = commit_file(&repo, "b.txt", "two");
+        assert_ne!(first, second);
+
+        let wt_path = repo.join(".worktrees").join("based");
+        create_worktree(&repo, "based", &wt_path, "nexus/based", Some(&first), None).unwrap();
+
+        assert_eq!(
+            head_sha(&wt_path),
+            first,
+            "worktree should start at the requested base, not the primary HEAD"
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_without_base_uses_primary_head() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_test_repo(&repo);
+        commit_file(&repo, "a.txt", "one");
+        let second = commit_file(&repo, "b.txt", "two");
+
+        let wt_path = repo.join(".worktrees").join("unbased");
+        create_worktree(&repo, "unbased", &wt_path, "nexus/unbased", None, None).unwrap();
+
+        assert_eq!(head_sha(&wt_path), second);
+    }
+
+    #[test]
+    fn test_hook_env_vars_includes_base_ref() {
+        let vars = hook_env_vars(
+            Path::new("/repo"),
+            Path::new("/repo/.worktrees/x"),
+            "nexus/x",
+            "x",
+            Some("abc123"),
+        );
+        let base = vars.iter().find(|(k, _)| k == "NEXUS_BASE_REF").unwrap();
+        assert_eq!(base.1, "abc123");
+    }
+
+    #[test]
+    fn test_hook_env_vars_base_ref_empty_when_head() {
+        let vars = hook_env_vars(
+            Path::new("/repo"),
+            Path::new("/repo/.worktrees/x"),
+            "nexus/x",
+            "x",
+            None,
+        );
+        let base = vars.iter().find(|(k, _)| k == "NEXUS_BASE_REF").unwrap();
+        assert_eq!(base.1, "");
+    }
+
     #[test]
     fn test_branch_exists() {
         let tmp = tempfile::tempdir().unwrap();
@@ -785,7 +1485,7 @@ mod tests {
         let branch = "nexus/test-session";
 
         // Create
-        create_worktree(&repo, "test-session", &wt_path, branch, None).unwrap();
+        create_worktree(&repo, "test-session", &wt_path, branch, None, None).unwrap();
         assert!(wt_path.exists());
         assert!(branch_exists(&repo, branch));
 

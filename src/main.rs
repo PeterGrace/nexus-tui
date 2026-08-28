@@ -106,7 +106,24 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
                     "on-worktree-create",
                     config.worktree.on_create.as_deref(),
                 );
-                git::create_worktree(&repo.root, &name, &wt_path, &branch, create_hook.as_deref())?;
+                let base_settings = git::resolve_base_settings(
+                    &repo.root,
+                    config.worktree.base.as_deref(),
+                    config.worktree.fetch,
+                );
+                let base = git::resolve_base(&repo.root, &base_settings);
+                if let Some(warning) = &base.warning {
+                    eprintln!("warning: {warning}");
+                }
+                git::create_worktree(
+                    &repo.root,
+                    &name,
+                    &wt_path,
+                    &branch,
+                    base.rev.as_deref(),
+                    create_hook.as_deref(),
+                )?;
+                println!("Worktree branch '{}' based on {}", branch, base.display);
                 Some((
                     wt_path.to_string_lossy().to_string(),
                     types::WorktreeInfo {

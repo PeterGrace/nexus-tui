@@ -59,6 +59,12 @@ impl Default for TmuxConfig {
 pub struct WorktreeConfig {
     #[serde(default)]
     pub branch_prefix: Option<String>,
+    /// Where new worktree branches start: `auto`, `HEAD`, or a git revision.
+    #[serde(default)]
+    pub base: Option<String>,
+    /// Fetch a remote base before branching from it. Defaults to true.
+    #[serde(default)]
+    pub fetch: Option<bool>,
     #[serde(default)]
     pub on_create: Option<String>,
     #[serde(default)]
@@ -230,6 +236,25 @@ branch_prefix = ""
     fn test_worktree_prefix_absent() {
         let cfg = parse_and_validate("").unwrap();
         assert_eq!(cfg.worktree.branch_prefix, None);
+    }
+
+    #[test]
+    fn test_worktree_base_configured() {
+        let toml = r#"
+[worktree]
+base = "origin/develop"
+fetch = false
+"#;
+        let cfg = parse_and_validate(toml).unwrap();
+        assert_eq!(cfg.worktree.base, Some("origin/develop".to_string()));
+        assert_eq!(cfg.worktree.fetch, Some(false));
+    }
+
+    #[test]
+    fn test_worktree_base_absent() {
+        let cfg = parse_and_validate("").unwrap();
+        assert!(cfg.worktree.base.is_none());
+        assert!(cfg.worktree.fetch.is_none());
     }
 
     #[test]

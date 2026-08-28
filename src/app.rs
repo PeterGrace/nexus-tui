@@ -139,7 +139,7 @@ pub struct App {
 
 /// Bundled state for a background worktree creation.
 struct PendingWorktreeCreate {
-    rx: mpsc::Receiver<color_eyre::Result<()>>,
+    rx: mpsc::Receiver<color_eyre::Result<git::ResolvedBase>>,
     ctx: PendingWorktreeCtx,
 }
 
@@ -1665,6 +1665,14 @@ impl App {
             self.config.worktree.on_create.as_deref(),
         );
 
+        // Config lookup is a local file read, so it stays on the main thread.
+        // Resolving it to a commit may fetch, so that happens on the worker.
+        let base_settings = git::resolve_base_settings(
+            &repo_root,
+            self.config.worktree.base.as_deref(),
+            self.config.worktree.fetch,
+        );
+
         // Spawn named background thread for worktree creation
         let root_clone = repo_root.clone();
         let session_name = name.to_string();
@@ -1674,13 +1682,16 @@ impl App {
         std::thread::Builder::new()
             .name("nexus-wt-create".to_string())
             .spawn(move || {
+                let base = git::resolve_base(&root_clone, &base_settings);
                 let result = git::create_worktree(
                     &root_clone,
                     &session_name,
                     &wt_path,
                     &branch_clone,
+                    base.rev.as_deref(),
                     create_hook.as_deref(),
-                );
+                )
+                .map(|()| base);
                 let _ = tx.send(result);
             })
             .expect("thread spawn");
@@ -1712,12 +1723,16 @@ impl App {
         let ctx = self.pending_wt_create.take().unwrap().ctx;
 
         match result {
-            Ok(()) => {
+            Ok(base) => {
                 let wt_info = WorktreeInfo {
                     branch: ctx.branch,
                     repo_root: ctx.repo_root,
                 };
-                self.status_message = Some(("Worktree created".to_string(), Instant::now()));
+                let msg = match &base.warning {
+                    Some(warning) => format!("Worktree created ({warning})"),
+                    None => format!("Worktree created from {}", base.display),
+                };
+                self.status_message = Some((msg, Instant::now()));
                 self.finalize_session_creation(
                     &ctx.name,
                     &ctx.cwd,
