@@ -419,7 +419,9 @@ fn render_confirm(frame: &mut Frame, panel_area: Rect, app: &App) {
         Some(InputContext::ConfirmDeleteSession { .. }) => "Delete this session? (y/n)",
         Some(InputContext::ConfirmDeleteGroup { .. }) => "Delete this group? (y/n)",
         Some(InputContext::NewSessionWorktree { .. }) => "Isolate in git worktree? (y/n)",
-        Some(InputContext::NewSessionAgent { .. }) => "Coding agent: (c) Claude / Code(x) / (p) Pi",
+        Some(InputContext::NewSessionAgent { .. }) => {
+            "Coding agent: (c) Claude / Code(x) / (p) Pi / (z) Zidane"
+        }
         _ => "Confirm? (y/n)",
     };
 

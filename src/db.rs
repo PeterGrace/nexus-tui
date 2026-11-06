@@ -173,9 +173,9 @@ impl Database {
 
         let wt_branch = worktree.map(|w| w.branch.as_str());
         let wt_repo = worktree.map(|w| w.repo_root.to_string_lossy().to_string());
-        // Pi can accept a caller-assigned session ID. Reuse the Nexus UUID so
+        // Pi and Zidane accept a caller-assigned session ID. Reuse the Nexus UUID so
         // the ID is persisted atomically, before the agent is launched.
-        let agent_session_id = (agent == SessionAgent::Pi).then_some(id.as_str());
+        let agent_session_id = agent.accepts_session_id().then_some(id.as_str());
 
         self.conn.execute(
             "INSERT INTO sessions
@@ -699,6 +699,25 @@ mod tests {
         let sessions = db.ungrouped_session_summaries(true).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].agent, SessionAgent::Pi);
+        assert_eq!(sessions[0].agent_session_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn test_zidane_agent_roundtrip() {
+        let db = Database::open_in_memory().unwrap();
+        let id = db
+            .create_nexus_session_with_agent(
+                "zidane-session",
+                "/tmp/project",
+                "zidane-session",
+                None,
+                SessionAgent::Zidane,
+            )
+            .unwrap();
+
+        let sessions = db.ungrouped_session_summaries(true).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].agent, SessionAgent::Zidane);
         assert_eq!(sessions[0].agent_session_id.as_deref(), Some(id.as_str()));
     }
 

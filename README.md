@@ -1,6 +1,6 @@
 # Nexus
 
-TUI session manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenAI Codex](https://developers.openai.com/codex/cli/), and [Pi](https://pi.dev/).
+TUI session manager for [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [OpenAI Codex](https://developers.openai.com/codex/cli/), [Pi](https://pi.dev/), and [Zidane](https://github.com/Tahul/zidane).
 
 ![CI](https://github.com/markx3/nexus-tui/actions/workflows/ci.yml/badge.svg)
 
@@ -14,9 +14,9 @@ Nexus gives you a persistent, organized workspace for managing multiple coding-a
 - **Session grouping** — organize sessions by project via config or on-the-fly
 - **8 color themes** — cycle with `Alt+t`, persisted across restarts
 - **Session lifecycle** — create, rename, move, delete, and kill sessions from the TUI or CLI
-- **Claude, Codex, or Pi** — choose which coding agent to run for each new session
+- **Claude, Codex, Pi, or Zidane** — choose which coding agent to run for each new session
 - **Worktree isolation** — optionally create a dedicated git worktree per session for branch-level isolation
-- **Session resume** — automatically detects Claude Code, Codex, and Pi session IDs so relaunched sessions resume where they left off
+- **Session resume** — detects Claude Code and Codex session IDs and assigns stable IDs to Pi and Zidane so relaunched sessions resume where they left off
 - **Codex sandbox and approvals** — fresh and resumed Codex sessions launch with `--no-daemon --sandbox workspace-write --ask-for-approval on-request`, bypassing the shared background server and overriding the sandbox and approval settings in your Codex config. Codex decides when to request approval.
 - **Claude bypass permissions ready** — Claude sessions launch with `--allow-dangerously-skip-permissions`, so you can select "bypass permissions" mode from inside Claude Code (Shift+Tab) when you want it; it is not enabled automatically
 - **CLI + JSON output** — scriptable interface for all operations (`nexus list --json`)
@@ -28,7 +28,9 @@ Nexus gives you a persistent, organized workspace for managing multiple coding-a
 
 ## Install
 
-Requires [tmux](https://github.com/tmux/tmux), a [Rust toolchain](https://rustup.rs/), and at least one supported coding-agent CLI (`claude`, `codex`, or `pi`) on your `PATH`.
+Requires [tmux](https://github.com/tmux/tmux), a [Rust toolchain](https://rustup.rs/), and at least one supported coding-agent CLI (`claude`, `codex`, `pi`, or `zidane`) on your `PATH`.
+
+Install Zidane’s terminal app with `npm install -g zidane-tui` ([upstream CLI](https://github.com/Tahul/zidane/blob/main/tui/src/cli.ts)). Choose `(z) Zidane` in the new-session prompt or pass `--agent zidane`. Nexus launches it with `--no-daemon --session-id <id>` so relaunches reopen the same conversation.
 
 ```sh
 # From GitHub
@@ -100,6 +102,7 @@ nexus new <name> -c /path -g mygroup # With cwd and group
 nexus new <name> -w                  # Create with an isolated git worktree
 nexus new <name> --agent codex       # Create and launch a Codex session
 nexus new <name> --agent pi          # Create and launch a Pi session
+nexus new <name> --agent zidane      # Create and launch a Zidane session
 nexus launch <id>                    # Launch/resume a session in tmux
 nexus kill <name>                    # Kill a running tmux session
 nexus groups                         # List configured groups

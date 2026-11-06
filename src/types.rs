@@ -18,16 +18,23 @@ pub enum SessionAgent {
     Claude,
     Codex,
     Pi,
+    Zidane,
     #[value(skip)]
     Unknown,
 }
 
 impl SessionAgent {
+    /// Agents that can create or reopen an exact caller-assigned session ID.
+    pub fn accepts_session_id(self) -> bool {
+        matches!(self, Self::Pi | Self::Zidane)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Pi => "pi",
+            Self::Zidane => "zidane",
             Self::Unknown => "unknown",
         }
     }
@@ -37,6 +44,7 @@ impl SessionAgent {
             "codex" => Self::Codex,
             "claude" => Self::Claude,
             "pi" => Self::Pi,
+            "zidane" => Self::Zidane,
             _ => Self::Unknown,
         }
     }

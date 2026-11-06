@@ -6,7 +6,7 @@ use crate::types::SessionAgent;
 #[command(
     name = "nexus",
     version,
-    about = "TUI session manager for Claude Code, Codex, and Pi"
+    about = "TUI session manager for Claude Code, Codex, Pi, and Zidane"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -105,4 +105,21 @@ pub enum Commands {
     },
     /// Update nexus to the latest version from source
     Update,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zidane_agent_is_selectable() {
+        let cli = Cli::try_parse_from(["nexus", "new", "test", "--agent", "zidane"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::New {
+                agent: SessionAgent::Zidane,
+                ..
+            })
+        ));
+    }
 }

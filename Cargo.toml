@@ -2,7 +2,7 @@
 name = "nexus"
 version = "0.3.3"
 edition = "2021"
-description = "TUI session manager for Claude Code, Codex, and Pi"
+description = "TUI session manager for Claude Code, Codex, Pi, and Zidane"
 license = "MIT"
 authors = ["Marcos Felipe Eipper"]
 repository = "https://github.com/markx3/nexus-tui"

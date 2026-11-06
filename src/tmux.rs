@@ -66,6 +66,16 @@ fn agent_command(agent: SessionAgent, resume_id: Option<&str>) -> Result<AgentCo
                 args,
             })
         }
+        SessionAgent::Zidane => {
+            let mut args = vec!["--no-daemon".to_string()];
+            if let Some(id) = resume_id {
+                args.extend(["--session-id".to_string(), id.to_string()]);
+            }
+            Ok(AgentCommand {
+                program: "zidane",
+                args,
+            })
+        }
         SessionAgent::Unknown => bail!("cannot launch a session with an unknown coding agent"),
     }
 }
@@ -1113,6 +1123,19 @@ session-c:win3:0:\n";
                 args: vec!["--session-id".to_string(), "pi-id".to_string()],
             }
         );
+    }
+
+    #[test]
+    fn test_agent_command_zidane() {
+        for id in [None, Some("zidane-id")] {
+            let command = agent_command(SessionAgent::Zidane, id).unwrap();
+            assert_eq!(command.program, "zidane");
+            let expected = match id {
+                None => vec!["--no-daemon"],
+                Some(id) => vec!["--no-daemon", "--session-id", id],
+            };
+            assert_eq!(command.args, expected);
+        }
     }
 
     #[test]
