@@ -39,15 +39,15 @@ fn agent_command(agent: SessionAgent, resume_id: Option<&str>) -> Result<AgentCo
             })
         }
         SessionAgent::Codex => {
-            let mut args = vec![
+            let mut args = resume_id
+                .map(|id| vec!["resume".to_string(), id.to_string()])
+                .unwrap_or_default();
+            args.extend([
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
                 "--ask-for-approval".to_string(),
                 "on-request".to_string(),
-            ];
-            if let Some(id) = resume_id {
-                args.extend(["resume".to_string(), id.to_string()]);
-            }
+            ]);
             Ok(AgentCommand {
                 program: "codex",
                 args,
@@ -1079,12 +1079,12 @@ session-c:win3:0:\n";
             AgentCommand {
                 program: "codex",
                 args: vec![
+                    "resume".to_string(),
+                    "codex-id".to_string(),
                     "--sandbox".to_string(),
                     "workspace-write".to_string(),
                     "--ask-for-approval".to_string(),
                     "on-request".to_string(),
-                    "resume".to_string(),
-                    "codex-id".to_string(),
                 ],
             }
         );
