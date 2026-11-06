@@ -39,9 +39,15 @@ fn agent_command(agent: SessionAgent, resume_id: Option<&str>) -> Result<AgentCo
             })
         }
         SessionAgent::Codex => {
-            let args = resume_id
-                .map(|id| vec!["resume".to_string(), id.to_string()])
-                .unwrap_or_default();
+            let mut args = vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "--ask-for-approval".to_string(),
+                "on-request".to_string(),
+            ];
+            if let Some(id) = resume_id {
+                args.extend(["resume".to_string(), id.to_string()]);
+            }
             Ok(AgentCommand {
                 program: "codex",
                 args,
@@ -1056,7 +1062,12 @@ session-c:win3:0:\n";
             agent_command(SessionAgent::Codex, None).unwrap(),
             AgentCommand {
                 program: "codex",
-                args: Vec::new(),
+                args: vec![
+                    "--sandbox".to_string(),
+                    "workspace-write".to_string(),
+                    "--ask-for-approval".to_string(),
+                    "on-request".to_string(),
+                ],
             }
         );
     }
@@ -1067,7 +1078,14 @@ session-c:win3:0:\n";
             agent_command(SessionAgent::Codex, Some("codex-id")).unwrap(),
             AgentCommand {
                 program: "codex",
-                args: vec!["resume".to_string(), "codex-id".to_string()],
+                args: vec![
+                    "--sandbox".to_string(),
+                    "workspace-write".to_string(),
+                    "--ask-for-approval".to_string(),
+                    "on-request".to_string(),
+                    "resume".to_string(),
+                    "codex-id".to_string(),
+                ],
             }
         );
     }
