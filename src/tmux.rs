@@ -67,6 +67,9 @@ fn agent_command(agent: SessionAgent, resume_id: Option<&str>) -> Result<AgentCo
             })
         }
         SessionAgent::Zidane => {
+            // Zidane's `--session-id` loads an existing session or creates one
+            // for an unknown ID. Nexus passes its persisted UUID on the first
+            // launch too, so this create-or-reopen behavior is required.
             let mut args = vec!["--no-daemon".to_string()];
             if let Some(id) = resume_id {
                 args.extend(["--session-id".to_string(), id.to_string()]);
