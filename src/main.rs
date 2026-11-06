@@ -152,7 +152,7 @@ fn run_cli(command: cli::Commands, json: bool) -> Result<()> {
             }
 
             if tmux.is_available() {
-                let agent_session_id = (agent == types::SessionAgent::Pi).then_some(id.as_str());
+                let agent_session_id = agent.accepts_session_id().then_some(id.as_str());
                 tmux.launch_agent_session(&tmux_name, session_cwd, agent, agent_session_id)?;
             }
             println!("Created session '{}' ({})", name, id);

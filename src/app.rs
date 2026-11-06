@@ -1133,6 +1133,7 @@ impl App {
                 KeyCode::Char('c') | KeyCode::Char('C') => Some(SessionAgent::Claude),
                 KeyCode::Char('x') | KeyCode::Char('X') => Some(SessionAgent::Codex),
                 KeyCode::Char('p') | KeyCode::Char('P') => Some(SessionAgent::Pi),
+                KeyCode::Char('z') | KeyCode::Char('Z') => Some(SessionAgent::Zidane),
                 KeyCode::Esc => {
                     self.input_mode = InputMode::Normal;
                     self.input_context = None;
@@ -1574,7 +1575,8 @@ impl App {
             .db
             .next_unique_tmux_name(&tmux_name, None)
             .unwrap_or(tmux_name);
-        let snapshot = (agent != SessionAgent::Pi).then(|| snapshot_agent_session_ids(agent, cwd));
+        let snapshot =
+            (!agent.accepts_session_id()).then(|| snapshot_agent_session_ids(agent, cwd));
         match self
             .db
             .create_nexus_session_with_agent(name, cwd, &tmux_name, worktree, agent)
@@ -1590,7 +1592,7 @@ impl App {
                     }
                 }
                 if self.tmux_available {
-                    let agent_session_id = (agent == SessionAgent::Pi).then_some(id.as_str());
+                    let agent_session_id = agent.accepts_session_id().then_some(id.as_str());
                     if let Err(e) =
                         self.tmux
                             .launch_agent_session(&tmux_name, cwd, agent, agent_session_id)
@@ -1811,9 +1813,10 @@ impl App {
                 };
 
                 let resume_id = match session.agent {
-                    SessionAgent::Claude | SessionAgent::Codex | SessionAgent::Pi => {
-                        session.agent_session_id.as_deref()
-                    }
+                    SessionAgent::Claude
+                    | SessionAgent::Codex
+                    | SessionAgent::Pi
+                    | SessionAgent::Zidane => session.agent_session_id.as_deref(),
                     SessionAgent::Unknown => None,
                 };
 
@@ -2035,7 +2038,7 @@ impl App {
                 SessionAgent::Claude => detect_claude_session_id(cwd, snapshot),
                 SessionAgent::Codex => detect_codex_session_id(cwd, snapshot),
                 SessionAgent::Pi => detect_pi_session_id(cwd, snapshot),
-                SessionAgent::Unknown => None,
+                SessionAgent::Zidane | SessionAgent::Unknown => None,
             };
             if let Some(agent_id) = detected {
                 let _ = self.db.set_agent_session_id(session_id, &agent_id);
@@ -2135,7 +2138,7 @@ fn collect_sessions_needing_detection(tree: &[TreeNode]) -> Vec<(String, Session
                     // Detection is retained only to recover legacy/imported rows
                     // whose agent_session_id is missing.
                     SessionAgent::Pi => s.agent_session_id.is_none(),
-                    SessionAgent::Unknown => false,
+                    SessionAgent::Zidane | SessionAgent::Unknown => false,
                 };
                 if missing_id && s.status != SessionStatus::Dead {
                     if let Some(cwd) = &s.cwd {
@@ -2196,7 +2199,7 @@ fn snapshot_agent_session_ids(agent: SessionAgent, cwd: &str) -> HashSet<String>
             .into_iter()
             .map(|session| session.id)
             .collect(),
-        SessionAgent::Unknown => HashSet::new(),
+        SessionAgent::Zidane | SessionAgent::Unknown => HashSet::new(),
     }
 }
 
@@ -2455,6 +2458,44 @@ mod tests {
             Vec::new(),
             db,
         )
+    }
+
+    #[test]
+    fn test_zidane_selection_persists_session_identity() {
+        for key in ['z', 'Z'] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut app = test_app(&temp);
+            app.prompt_for_agent(
+                "zidane-test".to_string(),
+                temp.path().to_string_lossy().to_string(),
+                None,
+                None,
+            );
+            app.handle_confirm_key(KeyEvent::new(
+                KeyCode::Char(key),
+                crossterm::event::KeyModifiers::NONE,
+            ));
+
+            assert_eq!(app.input_mode, InputMode::Normal);
+            let tree = app.db.get_tree().unwrap();
+            let session = tree
+                .iter()
+                .find_map(|node| match node {
+                    TreeNode::Session(session) => Some(session),
+                    TreeNode::Group(group) => group.children.iter().find_map(|node| match node {
+                        TreeNode::Session(session) => Some(session),
+                        _ => None,
+                    }),
+                })
+                .unwrap();
+            assert_eq!(session.agent, SessionAgent::Zidane);
+            assert_eq!(
+                session.agent_session_id.as_deref(),
+                Some(session.session_id.as_str())
+            );
+            assert!(app.jsonl_snapshots.is_empty());
+            assert!(collect_sessions_needing_detection(&app.tree).is_empty());
+        }
     }
 
     #[test]
