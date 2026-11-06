@@ -17,7 +17,7 @@ Nexus gives you a persistent, organized workspace for managing multiple coding-a
 - **Claude, Codex, or Pi** — choose which coding agent to run for each new session
 - **Worktree isolation** — optionally create a dedicated git worktree per session for branch-level isolation
 - **Session resume** — automatically detects Claude Code, Codex, and Pi session IDs so relaunched sessions resume where they left off
-- **Codex sandbox and approvals** — fresh and resumed Codex sessions launch with `--sandbox workspace-write --ask-for-approval on-request`, overriding those settings in your Codex config. Codex decides when to request approval.
+- **Codex sandbox and approvals** — fresh and resumed Codex sessions launch with `--no-daemon --sandbox workspace-write --ask-for-approval on-request`, bypassing the shared background server and overriding the sandbox and approval settings in your Codex config. Codex decides when to request approval.
 - **Claude bypass permissions ready** — Claude sessions launch with `--allow-dangerously-skip-permissions`, so you can select "bypass permissions" mode from inside Claude Code (Shift+Tab) when you want it; it is not enabled automatically
 - **CLI + JSON output** — scriptable interface for all operations (`nexus list --json`)
 - **Lazygit integration** — open lazygit in any session's working directory with `Alt+l`

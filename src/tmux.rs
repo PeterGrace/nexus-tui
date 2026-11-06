@@ -43,6 +43,7 @@ fn agent_command(agent: SessionAgent, resume_id: Option<&str>) -> Result<AgentCo
                 .map(|id| vec!["resume".to_string(), id.to_string()])
                 .unwrap_or_default();
             args.extend([
+                "--no-daemon".to_string(),
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
                 "--ask-for-approval".to_string(),
@@ -1063,6 +1064,7 @@ session-c:win3:0:\n";
             AgentCommand {
                 program: "codex",
                 args: vec![
+                    "--no-daemon".to_string(),
                     "--sandbox".to_string(),
                     "workspace-write".to_string(),
                     "--ask-for-approval".to_string(),
@@ -1081,6 +1083,7 @@ session-c:win3:0:\n";
                 args: vec![
                     "resume".to_string(),
                     "codex-id".to_string(),
+                    "--no-daemon".to_string(),
                     "--sandbox".to_string(),
                     "workspace-write".to_string(),
                     "--ask-for-approval".to_string(),
